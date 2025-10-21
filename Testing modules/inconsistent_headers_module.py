@@ -41,7 +41,7 @@ class TFMEmailReceivedModule(FileIngestModule):
             issues = core.analyze_received_chain(hops)
             summary, score = core.summarize_received_findings(hops, issues)
 
-            self._hit(f, u"RECEIVED headers", summary, score)
+            self._hit(f, u"Received  headers", summary, score)
             return IngestModule.ProcessResult.OK
         except Exception as e:
             IngestServices.getInstance().postMessage(

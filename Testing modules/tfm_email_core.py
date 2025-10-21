@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 # tfm_email_core.py — utilities
-
+from __future__ import unicode_literals
 
 import re, hashlib
 from email.utils import parsedate_tz, mktime_tz
 from email.Header import decode_header
 
-from email.Header import decode_header
 
 def u_(x):
     """Asegura unicode (Jython)."""
@@ -303,9 +302,9 @@ def summarize_received_findings(hops, issues):
 
     if issues['reverse_order']:
         pairs = ["{}→{}".format(a,b) for (a,b) in issues['reverse_order']]
-        parts.append("\n• Orden cronológico inverso en pares de hops: " + ", ".join(pairs))
+        parts.append("\n- Orden cronológico inverso en pares de hops: " + ", ".join(pairs))
     if issues['no_date']:
-        parts.append("\n• Hops sin fecha parseable: " + ", ".join(str(i) for i in issues['no_date']))
+        parts.append("\n- Hops sin fecha parseable: " + ", ".join(str(i) for i in issues['no_date']))
 
     # Desglosar IP privada en ALERTA vs INFO (local/org)
     priv_info = []
@@ -320,12 +319,12 @@ def summarize_received_findings(hops, issues):
             priv_alert.append(text)
 
     if priv_alert:
-        parts.append("\n• IP privada/loopback potencialmente expuesta en hops: " + ", ".join(priv_alert))
+        parts.append("\n- IP privada/loopback potencialmente expuesta en hops: " + ", ".join(priv_alert))
     if priv_info:
-        parts.append("\n• INFO: IP privada/loopback en hop local/organización: " + ", ".join(priv_info))
+        parts.append("\n- INFO: IP privada/loopback en hop local/organización: " + ", ".join(priv_info))
 
     if issues['link_breaks']:
-        parts.append("\n• Posibles hops faltantes (continuidad BY[i+1]≠FROM[i]) en: " +
+        parts.append("\n- Posibles hops faltantes (continuidad BY[i+1]≠FROM[i]) en: " +
                      ", ".join(str(i) for i in issues['link_breaks']))
 
     # Detalle compacto por hop
@@ -343,7 +342,7 @@ def summarize_received_findings(hops, issues):
         ))
 
     if len(parts) == 2:
-        parts.insert(1, "\n• Sin anomalías evidentes en Received.")
+        parts.insert(1, "\n- Sin anomalías evidentes en Received.")
 
     # Puntuación: severidad simple
     score = 0
@@ -361,5 +360,188 @@ def summarize_received_findings(hops, issues):
     score += priv_penalty
 
     score += 15 * len(issues['link_breaks'])
+
+    return "\n".join(parts), score
+
+# =============== DATE COHERENCE (helpers) ===============
+def get_date_header_epoch(msg):
+    """
+    Extrae y convierte la cabecera 'Date:' a epoch UTC.
+    Detecta y reporta múltiples cabeceras Date:
+    Devuelve (epoch, date_str, is_multiple_date_header)
+    """
+    date_list = msg.get_all('Date') or []
+    
+    is_multiple = len(date_list) > 1
+    
+    if not date_list:
+        return None, None, False
+        
+    # Usamos la primera Date: si hay múltiples, pero marcamos la anomalía
+    date_str = date_list[0] 
+    
+    if date_str:
+        epoch = date_to_epoch(date_str)
+        if epoch > 0:
+            return epoch, u_(date_str), is_multiple
+    return None, None, is_multiple
+
+def get_all_time_headers(msg):
+    """
+    Recopila épocas de cabeceras de tiempo alternativas.
+    Útiles como contexto, pero no para comprobaciones de coherencia fuertes.
+    """
+    ALT_HEADERS = ['X-Received', 'Delivery-date', 'Resent-Date', 'X-Original-ArrivalTime']
+    alt_dates = {}
+    
+    for h_name in ALT_HEADERS:
+        h_values = msg.get_all(h_name) or []
+        for val in h_values:
+            val = u_(val)
+            # X-Original-ArrivalTime es especial: "DD Mon YY HH:MM:SS.mmm (UTC) [IP]"
+            if h_name == 'X-Original-ArrivalTime':
+                # Intentamos extraer el timestamp del formato de Exchange
+                m = re.match(r'\s*(.+?)\s+\(UTC\)', val)
+                date_part = m.group(1) if m else val
+            else:
+                # Para otras, el valor completo es la fecha
+                date_part = val
+                
+            epoch = date_to_epoch(date_part)
+            if epoch > 0:
+                if h_name not in alt_dates:
+                    alt_dates[h_name] = []
+                alt_dates[h_name].append({'epoch': epoch, 'str': val})
+                
+    return alt_dates
+
+
+def analyze_date_coherence(date_epoch, date_str, is_multiple_date, hops, f_date, ingest_time):
+    """
+    Analiza la coherencia entre Date: (declarada), Received (último hop), 
+    metadatos de archivo (f_date), y la hora de ingesta (ingest_time).
+    
+    date_epoch: epoch de la cabecera Date:
+    is_multiple_date: True si se encontraron múltiples cabeceras Date:
+    hops: lista de hops de Received (del parser original)
+    f_date: epoch de la última modificación/creación del archivo EML
+    ingest_time: epoch del momento en que Autopsy está procesando
+    
+    Devuelve un diccionario de hallazgos.
+    """
+    issues = {
+        'no_date_header': False, 
+        'multiple_date_header': is_multiple_date, # Nuevo: Más de una Date:
+        'date_after_last_recv': None, 
+        'file_before_date': None, 
+        'file_after_last_recv': None,
+        'date_in_future': None, # Nuevo: Date: en el futuro (respecto a ingest_time)
+        'last_recv_epoch': None,
+        'last_recv_idx': None
+    }
+    
+    if date_epoch is None:
+        issues['no_date_header'] = True
+        return issues
+        
+    # 1. Obtener la fecha del primer hop Received (el último en el tiempo)
+    last_recv_epoch = None
+    last_recv_idx = None
+    for h in hops:
+        if h['epoch'] is not None:
+            # Encontramos la Received: con el timestamp más grande (más reciente)
+            if last_recv_epoch is None or h['epoch'] > last_recv_epoch:
+                last_recv_epoch = h['epoch']
+                last_recv_idx = h['idx']
+
+    issues['last_recv_epoch'] = last_recv_epoch
+    issues['last_recv_idx'] = last_recv_idx
+
+    # 2. Date: posterior al último Received
+    # Un desfase mayor a 5 minutos (300s) es sospechoso
+    if last_recv_epoch is not None:
+        diff = date_epoch - last_recv_epoch
+        if diff > 300: 
+            issues['date_after_last_recv'] = diff
+
+    # 3. Date: en el futuro (respecto al reloj de ingesta)
+    # Si Date: es más de 24h (86400s) en el futuro, es ALERTA fuerte
+    if ingest_time is not None:
+        diff_future = date_epoch - ingest_time
+        if diff_future > 86400: 
+            issues['date_in_future'] = diff_future
+    
+    # 4. Metadato de archivo EML (f_date) vs Date:
+    if f_date is not None and f_date > 0:
+        diff = date_epoch - f_date
+        # Si f_date es más de 7 días (604800s) anterior a Date:
+        if diff > 604800: 
+            issues['file_before_date'] = diff 
+        
+        # 5. Metadato de archivo EML (f_date) vs Último Received
+        if last_recv_epoch is not None:
+            diff_recv = f_date - last_recv_epoch
+            # Si f_date es más de 7 días (604800s) posterior al último Received:
+            if diff_recv > 604800: 
+                issues['file_after_last_recv'] = diff_recv
+
+    return issues
+
+def summarize_date_coherence_findings(date_str, f_date, issues, alt_dates):
+    """Construye el texto para Analysis Results + puntuación."""
+    parts = []
+    score = 0
+    
+    # Valores de entrada
+    parts.append("Fecha Declarada (Date:): {}".format(date_str or "AUSENTE / INVÁLIDA"))
+    parts.append("Último Received (Epoch): {}".format(issues['last_recv_epoch'] or "AUSENTE"))
+    parts.append("Metadato Archivo EML (M/C Time): {}".format(f_date or "AUSENTE"))
+    
+    # Nuevo: Cabeceras alternativas (solo contexto)
+    if alt_dates:
+        parts.append("\n--- Cabeceras de Tiempo Alternativas ---")
+        for h_name, dates in alt_dates.items():
+            for d in dates:
+                parts.append("• {}: {} (Epoch {})".format(h_name, d['str'], d['epoch']))
+    
+    parts.append("\n--- Hallazgos ---")
+    
+    if issues['no_date_header']:
+        parts.append("• ALERTA: Cabecera 'Date:' ausente o formato inválido.")
+        score += 30
+    else:
+        # Nuevo: Múltiples Date:
+        if issues['multiple_date_header']:
+            parts.append("• ALERTA: Múltiples cabeceras 'Date:' encontradas. Posible manipulación/reencapsulado.")
+            score += 45
+            
+        # Nuevo: Date en el futuro
+        if issues['date_in_future'] is not None:
+            diff_d = float(issues['date_in_future']) / (3600.0 * 24)
+            parts.append("• ¡SEVERA! 'Date:' está en el futuro (>{:.2f} días respecto a la hora de ingesta).".format(diff_d))
+            score += 80 # Subimos la severidad por esta anomalía
+            
+        # Desfase Date: vs Último Received
+        if issues['date_after_last_recv'] is not None:
+            diff_h = float(issues['date_after_last_recv']) / 3600.0
+            parts.append("• ALERTA: 'Date:' es posterior al último 'Received' (Hop #{}) por {:.2f} horas.".format(
+                issues['last_recv_idx'], diff_h
+            ))
+            score += 50 
+
+        # Desfase Metadato Archivo vs Date:
+        if issues['file_before_date'] is not None:
+            diff_d = float(issues['file_before_date']) / (3600.0 * 24)
+            parts.append("• INFO: 'Date:' es mucho posterior a la fecha del archivo EML ({:.2f} días).".format(diff_d))
+            score += 15 
+
+        # Desfase Metadato Archivo vs Último Received
+        if issues['file_after_last_recv'] is not None:
+            diff_d = float(issues['file_after_last_recv']) / (3600.0 * 24)
+            parts.append("• ALERTA: Fecha del archivo EML es posterior al último 'Received' ({:.2f} días). Sugiere manipulación del archivo.".format(diff_d))
+            score += 40 
+            
+    if score == 0:
+        parts.append("• Sin incongruencias temporales significativas detectadas.")
 
     return "\n".join(parts), score
