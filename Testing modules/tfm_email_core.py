@@ -5,7 +5,7 @@ from __future__ import unicode_literals
 import re, hashlib
 from email.utils import parsedate_tz, mktime_tz
 from email.Header import decode_header
-
+import math
 
 def u_(x):
     """Asegura unicode (Jython)."""
@@ -415,7 +415,6 @@ def get_all_time_headers(msg):
                 
     return alt_dates
 
-
 def analyze_date_coherence(date_epoch, date_str, is_multiple_date, hops, f_date, ingest_time):
     """
     Analiza la coherencia entre Date: (declarada), Received (último hop), 
@@ -545,3 +544,139 @@ def summarize_date_coherence_findings(date_str, f_date, issues, alt_dates):
         parts.append("• Sin incongruencias temporales significativas detectadas.")
 
     return "\n".join(parts), score
+
+# ==== Message-ID utilities (duplicados / formato sospechoso) ====
+# Regex básica que captura algo tipo local@dominio dentro o fuera de '< >'
+_MSGID_RE = re.compile(r'\<?\s*([^>\s]+@[^>\s]+)\s*\>?', re.UNICODE)
+
+# Memoria por ejecución (ingest run):
+#   clave: msgid normalizado
+#   valor: lista de records: {'file_id': long, 'file_name': u'', 'from': u'', 'date': long, 'raw': u''}
+_MSGID_STORE = {}
+
+def msgid_normalize(raw):
+    """Normaliza el Message-ID (quita < >, trim, lower)."""
+    if not raw:
+        return None
+    r = u_(raw).strip()
+    if r.startswith(u'<') and r.endswith(u'>'):
+        r = r[1:-1].strip()
+    r = r.strip().lower()
+    return r or None
+
+def msgid_extract_candidates(header_value):
+    """
+    Dado el valor de la cabecera Message-ID (posible múltiple por malformación),
+    devuelve lista de candidatos normalizados.
+    """
+    if not header_value:
+        return []
+    hv = u_(header_value)
+    found = _MSGID_RE.findall(hv)
+    if not found:
+        nm = msgid_normalize(hv)
+        return [nm] if nm else []
+    out = []
+    for f in found:
+        nm = msgid_normalize(f)
+        if nm:
+            out.append(nm)
+    # dedup preservando orden
+    seen = set(); dedup = []
+    for x in out:
+        if x not in seen:
+            seen.add(x); dedup.append(x)
+    return dedup
+
+def msgid_get_local_part(msgid):
+    """Extrae la parte local (antes de @) del Message-ID."""
+    if not msgid or u'@' not in msgid:
+        return None
+    # Devuelve solo la primera parte
+    return msgid.split(u'@', 1)[0]
+
+def msgid_token_entropy(s):
+    """
+    Entropía de Shannon del string completo.
+    Devuelve: (H_total, H_normalizada) donde H_normalizada = H / Hmax (0..1).
+    """
+    if not s: 
+        return 0.0, 0.0
+    from collections import Counter
+    c = Counter(s)
+    n = float(len(s))
+    H = -sum((cnt/n)*math.log((cnt/n), 2) for cnt in c.values())
+    # Hmax = log2(#símbolos distintos); evita división por 0
+    uniq = len(c)
+    Hmax = math.log(uniq, 2) if uniq > 1 else 1.0
+    return H, (H / Hmax)
+
+def msgid_has_valid_format(msgid):
+    """
+    Formato válido mínimo: contiene '@' y la parte de dominio tiene letras/números
+    (admite localhost/hosts raros, pero descarta basura evidente).
+    """
+    if not msgid or u'@' not in msgid:
+        return False
+    local, domain = msgid.split(u'@', 1)
+    if not local or not domain:
+        return False
+    if len(local)< 5:
+        return False
+    return True if re.search(r'[A-Za-z0-9]', domain) else False
+
+def msgid_register(msgid, file_id, file_name, from_header=None, date_epoch=None, raw_msgid=None):
+    """Registra una aparición de msgid (por archivo) en el store global del run."""
+    nm = msgid_normalize(raw_msgid or msgid)
+    if not nm:
+        return
+    rec = {
+        'file_id'  : long(file_id) if file_id is not None else long(-1),
+        'file_name': u_(file_name) if file_name else u'',
+        'from'     : u_(from_header) if from_header else u'',
+        'date'     : long(date_epoch) if date_epoch else long(0),
+        'raw'      : u_(raw_msgid) if raw_msgid else u_(msgid),
+    }
+    _MSGID_STORE.setdefault(nm, []).append(rec)
+
+def msgid_clear_store():
+    """Limpia el índice en memoria."""
+    _MSGID_STORE.clear()
+
+def msgid_find_duplicates():
+    """Devuelve dict {msgid: [records]} SOLO para los msgids con más de una aparición."""
+    return {mid: recs for (mid, recs) in _MSGID_STORE.items() if len(recs) > 1}
+
+def msgid_score_and_labels(msgid, records):
+    """
+    Score SOLO para la pasada global (evita duplicidades con el análisis local):
+      +20 si remitentes distintos (posible spoof)
+      +10 si es duplicado (>1)
+    """
+    score = 0
+    labels = []
+
+    froms = set([ (r.get('from') or u'').lower() for r in records if r.get('from') ])
+    if len([f for f in froms if f]) > 1:
+        score += 20
+        labels.append('SPOOF_POSSIBLE')
+
+    if len(records) > 1:
+        score += 10
+        labels.append('DUPLICATE')
+
+    return score, labels
+
+def msgid_summarize(msgid, records):
+    """Estructura de resumen coherente con otros módulos."""
+    score, labels = msgid_score_and_labels(msgid, records)
+    return {
+        'msgid' : msgid,
+        'count' : len(records),
+        'files' : [u"{} (#{} )".format(r.get('file_name', u''), r.get('file_id', -1)) for r in records],
+        'froms' : list(sorted(set([u_(r.get('from')) for r in records if r.get('from')]))) or [],
+        'dates' : [long(r.get('date') or 0) for r in records],
+        'raws'  : [u_(r.get('raw')) for r in records],
+        'score' : score,
+        'labels': labels,
+    }
