@@ -2,10 +2,11 @@
 # tfm_email_core.py — utilities
 from __future__ import unicode_literals
 
-import re, hashlib
+import re, hashlib, base64
 from email.utils import parsedate_tz, mktime_tz
 from email.Header import decode_header
 import math
+import sys, os
 
 def u_(x):
     """Asegura unicode (Jython)."""
@@ -680,3 +681,455 @@ def msgid_summarize(msgid, records):
         'score' : score,
         'labels': labels,
     }
+
+# ==== X-HEADERS (X-Mailer, X-Exported-By, etc.) ====
+
+def extract_x_headers(msg):
+    """
+    Devuelve un dict con:
+      - 'all': lista de dicts {'name', 'value'}
+      - 'signals': dict con campos útiles normalizados/heurísticos
+    No lanza excepciones: valores siempre en unicode.
+    """
+    try:
+        items = msg.items() or []
+    except Exception:
+        items = []
+    x_all = []
+    for (k, v) in items:
+        try:
+            if not k: 
+                continue
+            kn = u_(k)
+            if kn.upper().startswith(u"X-"):
+                x_all.append({
+                    'name': kn,
+                    'value': decode_mime_header(v) if v else u""
+                })
+        except Exception:
+            # continúa con lo que se pueda
+            continue
+
+    # Señales específicas
+    def _first_value(prefix):
+        for h in x_all:
+            if h['name'].lower() == prefix.lower():
+                return h['value']
+        return None
+
+    # Conjuntos útiles
+    x_mailer   = _first_value('X-Mailer')
+    x_exported = _first_value('X-Exported-By')
+    x_mimeole  = _first_value('X-MimeOLE')
+    x_origip   = _first_value('X-Originating-IP')
+
+    # Familia Exchange/Microsoft (muy frecuente en export/servidor)
+    ms_family = [h for h in x_all if h['name'].lower().startswith('x-ms-') or
+                                   h['name'].lower().startswith('x-forefront-') or
+                                   h['name'].lower().startswith('x-microsoft-')]
+
+    # Heurística conservadora de "posible exportación"
+    # Caso fuerte: X-Exported-By presente
+    possible_export = True if x_exported else False
+
+    # Caso débil (solo INFO): cadenas típicas de clientes en X-Mailer
+    weak_client_hint = False
+    if x_mailer:
+        low = x_mailer.lower()
+        weak_client_hint = any(s in low for s in [
+            'outlook', 'thunderbird', 'apple mail', 'gmail', 'iphone mail', 'android mail'
+        ])
+
+    return {
+        'all': x_all,
+        'signals': {
+            'x_mailer'        : x_mailer,
+            'x_exported_by'   : x_exported,
+            'x_mimeole'       : x_mimeole,
+            'x_originating_ip': x_origip,
+            'ms_family_count' : len(ms_family),
+            'possible_export' : possible_export,
+            'weak_client_hint': weak_client_hint,
+        }
+    }
+
+def summarize_x_headers_findings(xdata):
+    """
+    Construye texto y puntuación para publicar en Analysis Results.
+    Puntuación:
+      +40 si X-Exported-By presente (posible exportación)
+      +10 si hay X-Mailer (solo contexto)
+      +5  si hay familia MS (solo contexto)
+    """
+    parts = []
+    score = 0
+
+    allx = xdata.get('all') or []
+    sigs = xdata.get('signals') or {}
+
+    parts.append("Cabeceras X-* encontradas: {}".format(len(allx)))
+
+    # Listado compacto (máximo 12 para no saturar)
+    max_list = 12
+    if allx:
+        parts.append("\n— Lista X-* (máx {} mostradas) —".format(max_list))
+        for i, h in enumerate(allx[:max_list]):
+            parts.append("• {}: {}".format(h.get('name', ''), h.get('value', '')))
+        if len(allx) > max_list:
+            parts.append("… ({} más)".format(len(allx) - max_list))
+    else:
+        parts.append("\n(no hay cabeceras X-*)")
+
+    parts.append("\n— Señales —")
+    if sigs.get('x_exported_by'):
+        parts.append("• POSIBLE EXPORTACIÓN: X-Exported-By = {}".format(sigs['x_exported_by']))
+        score += 40
+    else:
+        parts.append("• X-Exported-By: ausente")
+
+    if sigs.get('x_mailer'):
+        parts.append("• X-Mailer: {}".format(sigs['x_mailer']))
+        score += 10
+    else:
+        parts.append("• X-Mailer: ausente")
+
+    if sigs.get('x_mimeole'):
+        parts.append("• X-MimeOLE: {}".format(sigs['x_mimeole']))
+
+    if sigs.get('x_originating_ip'):
+        parts.append("• X-Originating-IP: {}".format(sigs['x_originating_ip']))
+
+    ms_count = int(sigs.get('ms_family_count') or 0)
+    if ms_count > 0:
+        parts.append("• Familia Microsoft/Exchange presente ({} cabeceras).".format(ms_count))
+        score += 5
+
+    # Nota: weak_client_hint es solo informativo, no suma puntos
+    if sigs.get('weak_client_hint'):
+        parts.append("• INFO: X-Mailer parece indicar un cliente reconocido.")
+
+    if score == 0:
+        parts.append("• Sin señales fuertes de exportación o manipulación derivables solo de X-*.")
+
+    return "\n".join(parts), int(score)
+
+# ==== DKIM UTILITIES ====
+def parse_dkim_headers(msg):
+    """
+    Extrae todas las cabeceras DKIM-Signature.
+    Devuelve una lista de dicts con campos principales.
+    """
+    dkims = msg.get_all('DKIM-Signature') or []
+    parsed = []
+    for raw in dkims:
+        try:
+            fields = {}
+            for part in re.split(r';\s*', raw):
+                if '=' in part:
+                    k, v = part.split('=', 1)
+                    fields[k.strip()] = v.strip()
+            parsed.append(fields)
+        except Exception:
+            continue
+    return parsed
+
+def verify_dkim_structure(fields):
+    """
+    Verifica la presencia mínima de campos DKIM y coherencia básica.
+    No realiza validación criptográfica completa (sin DNS),
+    pero detecta firmas truncadas, hash/body inconsistente, etc.
+    """
+    required = ['v', 'a', 'b', 'bh', 'd', 's', 'h','c','i','l','q','t','x']
+    missing = [k for k in required if k not in fields]
+    issues = []
+    if missing:
+        issues.append("Faltan campos: {}".format(', '.join(missing)))
+
+    # Longitud de firma base64 b= (típicamente >100 chars)
+    if 'b' in fields:
+        try:
+            siglen = len(fields['b'])
+            if siglen < 50:
+                issues.append("Firma (b=) inusualmente corta.")
+        except:
+            pass
+
+    # Hash body (bh=) debería ser base64
+    if 'bh' in fields:
+        bh = fields['bh']
+        try:
+            base64.b64decode(bh)
+        except Exception:
+            issues.append("Campo bh= no es base64 válido.")
+
+    return issues
+
+def check_dkim_domain_alignment(dkim_domain, from_header):
+    # Extraer la parte de la dirección y luego el dominio.
+    from_part = from_header.strip().lower()
+    
+    # 1. Limpieza de display name y corchetes angulares
+    if '<' in from_part and '>' in from_part:
+        from_part = from_part.split('<')[-1].split('>')[0]
+    
+    # 2. Extracción del dominio tras el '@'
+    if '@' in from_part:
+        from_domain = from_part.split('@')[-1]
+    else:
+        # Si no hay @, asumimos que from_part ya es el dominio o está malformado
+        from_domain = from_part
+    
+    return "ALIGNED" if _same_org(dkim_domain, from_domain) else "MISALIGNED"
+
+def dkim_selector_dns_exists(selector, domain):
+    """
+    Comprobación DNS simulada: no realiza query real (Jython sin red),
+    pero valida formato plausible de selector._domainkey.domain.
+    Devuelve True si selector/domino tienen formato correcto.
+    """
+    if not selector or not domain:
+        return False
+    fqdn = "{}._domainkey.{}".format(selector, domain)
+    return bool(re.match(r'^[A-Za-z0-9._-]+\._domainkey\.[A-Za-z0-9.-]+$', fqdn))
+
+# Lista para simular la reputación/expectativa de firma (basada en el dominio organizativo)
+_EXPECTED_SIGNERS = {
+    'gmail.com':    True,  # Siempre debería firmar
+    'google.com':   True,
+    'microsoft.com': True,
+    'outlook.com':  True,
+    'yahoo.com':    True,
+}
+
+def dkim_expected_to_sign(dkim_domain):
+    """
+    Comprueba si el dominio organizativo DKIM está en la lista de firmantes esperados.
+    Si AUSENTE, el score penaliza más. Si PRESENTE y NO FIRMA, penaliza AÚN MÁS.
+    """
+    if not dkim_domain: return False
+    org_dom = _org_domain(_norm_host(dkim_domain))
+    return _EXPECTED_SIGNERS.get(org_dom, False)
+
+def summarize_dkim_findings(parsed, from_header):
+    """
+    Construye el resumen textual + puntuación global DKIM.
+    """
+    parts = []
+    score = 0
+
+    if not parsed:
+        parts.append("Cabecera DKIM-Signature: AUSENTE")
+        
+        from_part = u_(from_header).strip().lower() 
+        # 1. Limpieza de display name y corchetes angulares
+        if u'<' in from_part and u'>' in from_part:
+            from_part = from_part.split(u'<')[-1].split(u'>')[0]
+        
+        # 2. Extracción del dominio tras el '@'
+        if u'@' in from_part:
+            from_domain = from_part.split(u'@')[-1].strip()
+        else:
+            from_domain = from_part.strip()
+
+        # Chequeo de Reputación
+        if from_domain:
+            if dkim_expected_to_sign(from_domain):
+                parts.append("• ¡ALERTA! El dominio organizativo '{}' normalmente firma sus correos (Firma Esperada: AUSENTE).".format(_org_domain(_norm_host(from_domain))))
+                score += 50 # Penalización muy alta
+            else:
+                parts.append("• Contexto: El dominio organizativo '{}' no está marcado como firmante esperado.".format(_org_domain(_norm_host(from_domain))))
+        else:
+            parts.append("• Contexto: No todos los dominios firman sus correos (depende del remitente).")
+
+        return "\n".join(parts), score
+
+    parts.append("Cabeceras DKIM-Signature encontradas: {}".format(len(parsed)))
+
+    for i, f in enumerate(parsed):
+        d = f.get('d'); s = f.get('s')
+        issues = verify_dkim_structure(f)
+        align = check_dkim_domain_alignment(d, from_header)
+        dns_ok = dkim_selector_dns_exists(s, d)
+
+        parts.append("\n— Firma #{:d} —".format(i+1))
+        parts.append("Dominio (d=): {}".format(d or "N/D"))
+        parts.append("Selector (s=): {}".format(s or "N/D"))
+        parts.append("Alineación DKIM↔From: {}".format(align))
+        parts.append("Selector DNS formato válido: {}".format("Sí" if dns_ok else "No"))
+        if issues:
+            parts.append("Problemas: " + "; ".join(issues))
+            score += 20 * len(issues)
+        if align == "MISALIGNED":
+            score += 30
+        if not dns_ok:
+            score += 10
+
+    if len(parsed) > 1:
+        parts.append("\nALERTA: múltiples firmas DKIM encontradas (posible reenvío o conflicto).")
+        score += 15
+
+    if score == 0:
+        parts.append("\nSin anomalías DKIM evidentes (firma válida o formato coherente).")
+
+    return "\n".join(parts), score
+
+# === External DKIM verifier bridge ===
+import subprocess, json, tempfile, time
+
+def _find_python_exe_for_tools():
+    core_dir = os.path.dirname(os.path.abspath(__file__))       # ...\python_modules\core
+    pm_root  = os.path.dirname(core_dir)                         # ...\python_modules
+    venv_py  = os.path.join(pm_root, "venv_autopsy", "Scripts", "python.exe")
+    if os.path.exists(venv_py):
+        return venv_py
+    return "python"  # fallback
+
+def _find_external_dkim_script():
+    """
+    Ruta esperada:
+    CORE/tfm_dkim_check.py
+    """
+    base = os.path.dirname(os.path.abspath(__file__))  # core directory
+    candidate = os.path.join(base, "tfm_dkim_check.py")
+    if os.path.exists(candidate):
+        return os.path.normpath(candidate)
+    return None
+
+def run_external_dkim_check(raw_bytes, timeout=15):
+    """
+    Lanza el checker Python3 externo pasando raw_bytes por stdin.
+    Sin usar subprocess.TimeoutExpired (no existe en Jython).
+    Implementa timeout propio con poll().
+    """
+    script = _find_external_dkim_script()
+    if not script:
+        raise Exception("DKIM script not found (core\tfm_dkim_check.py)")
+    pyexe = _find_python_exe_for_tools()
+    cmd = [pyexe, script]
+
+    # Abrimos el proceso con pipes
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except Exception as e:
+        raise Exception("Failed to start checker: {}".format(e))
+
+    # Escribir stdin de forma segura en Jython
+    try:
+        if raw_bytes is None:
+            raw_bytes = b""
+        # En Jython, 'bytes' puede no existir; aseguramos tipo 'str' binaria
+        try:
+            # si ya son bytes, OK; si es unicode, codifica
+            if isinstance(raw_bytes, unicode):  # Jython
+                raw_bytes = raw_bytes.encode('utf-8', 'ignore')
+        except NameError:
+            # En CPython no hay 'unicode'
+            if isinstance(raw_bytes, str):
+                raw_bytes = raw_bytes.encode('utf-8', 'ignore')
+
+        proc.stdin.write(raw_bytes)
+        proc.stdin.flush()
+        proc.stdin.close()
+    except Exception:
+        # si falla la escritura, intentaremos igualmente leer/terminar
+        pass
+
+    # Emular timeout: espera activa con poll()
+    start = time.time()
+    interval = 0.2
+    while True:
+        rc = proc.poll()
+        if rc is not None:
+            break
+        if (time.time() - start) > timeout:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            raise Exception("DKIM script timeout (poll emulation, no TimeoutExpired in Jython)")
+        time.sleep(interval)
+
+    # Proceso terminó: lee stdout/stderr
+    try:
+        out = proc.stdout.read()
+    except Exception:
+        out = b""
+    try:
+        err = proc.stderr.read()
+    except Exception:
+        err = b""
+
+    # Manejo de códigos de retorno (el script usa rc=2 para deps faltantes)
+    if rc not in (0, 2):
+        raise Exception("DKIM checker failed (rc={}): {}".format(rc, (err or b"").decode('utf-8', 'ignore')))
+
+    # Parsear JSON
+    try:
+        return json.loads((out or b"").decode('utf-8', 'ignore'))
+    except Exception as e:
+        raise Exception("Invalid JSON from DKIM checker: {}".format(e))
+    
+def summarize_external_dkim_result(dkim_json):
+    """
+    Convierte la estructura retornada por run_external_dkim_check() a
+    un string compacto y puntuación para Analysis Results.
+    """
+    if not dkim_json:
+        return ("No hay resultado DKIM (error interno).", 50)
+
+    if "error" in dkim_json:
+        return ("Error DKIM externo: {} - {}".format(dkim_json.get('error'), dkim_json.get('msg', '')), 60)
+
+    parts = []
+    score = 0
+
+    # parts.append("From: {}".format(dkim_json.get('from_header') or "AUSENTE"))
+    parts.append("DKIM signatures: {}".format(dkim_json.get('dkim_signatures_count', 0)))
+
+    verify = dkim_json.get('verify', {})
+    aligned_any = any(s.get('alignment') == 'ALIGNED' for s in dkim_json.get('signatures', []))
+    dns_ok_any  = any(s.get('selector_dns_ok') for s in dkim_json.get('signatures', []))
+    usually     = bool(dkim_json.get('domain_usually_signs'))
+    if verify.get('verify_attempted'):
+        if verify.get('verified'):
+            parts.append("Verificación criptográfica: OK (al menos una firma verificó).")
+        else:
+            parts.append("Verificación criptográfica: FALLIDA. Error: {}".format(verify.get('verify_error')))
+            score += 60
+            if dns_ok_any and aligned_any and usually: # Heurística de manipulación:
+                parts.append("Indicador fuerte: Selector DNS OK, alineación ALIGNED y el dominio suele firmar → "
+                             "la copia parece ALTERADA (cambios en cabeceras/cuerpo/EOL).")
+                score += 30
+    else:
+        parts.append("Verificación criptográfica: NO REALIZADA (fallo en el entorno).")
+        score += 40
+
+    # Por cada firma, resumir estado DNS/alignment
+    for i, s in enumerate(dkim_json.get('signatures', []) ):
+        parts.append("\n- Firma #{}: d={} s={}".format(i+1, s.get('d') or '-', s.get('s') or '-'))
+        parts.append("  alignment={}".format(s.get('alignment') or 'UNKNOWN'))
+        if not s.get('selector_dns_ok'):
+            parts.append("  selector DNS: NO encontrado")
+            score += 15
+        else:
+            # si txt presente, comprobar mínimo
+            txts = s.get('selector_txt') or []
+            if not txts:
+                parts.append("  selector DNS: encontrado pero sin TXT legible")
+                score += 10
+            else:
+                parts.append("  selector DNS: encontrado ({} records)".format(len(txts)))
+
+        if s.get('alignment') == 'MISALIGNED':
+            parts.append("  Nota: dominio DKIM distinto del dominio From: (MISALIGNED)")
+            score += 25
+
+    if dkim_json.get('domain_usually_signs'):
+        parts.append("\nContexto: Dominio del remitente suele firmar (whitelist).")
+    else:
+        parts.append("\nContexto: Dominio no marcado como 'suele firmar' en whitelist.")
+        # no puntuar fuerte, solo informativo
+
+    if score == 0:
+        parts.append("\nResumen: DKIM OK / sin problemas detectados por el verificador externo.")
+    return ("\n".join(parts), int(score))

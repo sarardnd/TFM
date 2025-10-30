@@ -1,0 +1,6 @@
+google.com
+microsoft.com
+example.com
+gmail.com
+yahoo.com
+outlook.com
