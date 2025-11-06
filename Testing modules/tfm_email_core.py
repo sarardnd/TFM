@@ -1095,7 +1095,7 @@ def summarize_external_dkim_result(dkim_json):
             parts.append("Verificación criptográfica: OK (al menos una firma verificó).")
         else:
             parts.append("Verificación criptográfica: FALLIDA. Error: {}".format(verify.get('verify_error')))
-            score += 60
+            score += 20
             if dns_ok_any and aligned_any and usually: # Heurística de manipulación:
                 parts.append("Indicador fuerte: Selector DNS OK, alineación ALIGNED y el dominio suele firmar → "
                              "la copia parece ALTERADA (cambios en cabeceras/cuerpo/EOL).")
@@ -1133,3 +1133,364 @@ def summarize_external_dkim_result(dkim_json):
     if score == 0:
         parts.append("\nResumen: DKIM OK / sin problemas detectados por el verificador externo.")
     return ("\n".join(parts), int(score))
+
+# ==== SPF / DMARC / ARC (parsers & evaluators) ====
+
+_AR_ITEM_RE = re.compile(r'(?P<key>[a-zA-Z0-9_.-]+)\s*=\s*(?P<val>[^;\s]+)')
+_AR_AUTHRES_ID_RE = re.compile(r'^\s*([a-z0-9.-]+)\s*;', re.IGNORECASE)
+
+def _parse_authres_line(line):
+    """
+    Parsea una línea de Authentication-Results en pares clave=valor.
+    Devuelve dict con: 'authserv_id', 'kv' (dict llano), y listas por mecanismo.
+    """
+    out = {'raw': u_(line), 'authserv_id': None, 'kv': {}, 'spf': [], 'dmarc': [], 'dkim': [], 'arc': [], 'other': []}
+    try:
+        m = _AR_AUTHRES_ID_RE.search(line or '')
+        if m:
+            out['authserv_id'] = m.group(1).strip().lower()
+        # Extraer tokens k=v
+        for m in _AR_ITEM_RE.finditer(line or ''):
+            k = m.group('key').strip().lower()
+            v = m.group('val').strip()
+            out['kv'][k] = v
+
+            # Clasificación aproximada por prefijo/mecanismo
+            if k.startswith('spf') or k == 'spf':
+                out['spf'].append((k, v))
+            elif k.startswith('dmarc') or k == 'dmarc':
+                out['dmarc'].append((k, v))
+            elif k.startswith('dkim') or k == 'dkim':
+                out['dkim'].append((k, v))
+            elif k.startswith('arc') or k == 'arc':
+                out['arc'].append((k, v))
+            else:
+                out['other'].append((k, v))
+    except Exception:
+        pass
+    return out
+
+def parse_authentication_results(msg):
+    """
+    Devuelve lista de estructuras parseadas de 'Authentication-Results'.
+    Mantiene orden (de arriba a abajo).
+    """
+    ars = msg.get_all('Authentication-Results') or []
+    parsed = []
+    for ar in ars:
+        # Unir líneas dobladas para robustez
+        line = ' '.join(u_(ar).split())
+        parsed.append(_parse_authres_line(line))
+    return parsed
+
+def _find_header_from_domain(from_header):
+    """Extrae dominio de From: para alineamientos DMARC/SPF."""
+    if not from_header:
+        return None
+    fp = u_(from_header).strip().lower()
+    if '<' in fp and '>' in fp:
+        fp = fp.split('<')[-1].split('>')[0]
+    if '@' in fp:
+        return fp.split('@')[-1].strip()
+    return fp.strip() or None
+
+def extract_received_spf(msg):
+    """
+    Algunas plataformas añaden 'Received-SPF: ...'
+    Acepta:
+      - email.message.Message (preferido)
+      - lista de líneas 'Received-SPF'
+    Devuelve el primer veredicto normalizado, o None si no hay.
+    """
+    if msg is None:
+        return None
+
+    rs = []
+    if hasattr(msg, 'get_all'):
+        try:
+            rs = msg.get_all('Received-SPF') or []
+        except Exception:
+            rs = []
+    elif isinstance(msg, (list, tuple)):
+        rs = list(msg)
+    else:
+        return None
+
+    if not rs:
+        return None
+
+    line = ' '.join(u_(rs[0]).split()).lower()
+    for tok in ('pass', 'softfail', 'fail', 'neutral', 'none', 'temperror', 'permerror'):
+        if tok in line:
+            return tok
+    return None
+
+def evaluate_spf(authres_list, from_header, msg=None):
+    """
+    Evalúa SPF según Authentication-Results (o Received-SPF como fallback con el objeto msg).
+    Retorna dict: {'result', 'smtp_mailfrom', 'helo', 'ip', 'aligned'}
+    """
+    from_dom = _find_header_from_domain(from_header)
+
+    def _extract_domain(val):
+        if not val:
+            return None
+        s = u_(val).strip().strip("<>").strip('"').strip("'")
+        if '@' in s:
+            s = s.split('@')[-1]
+        s = s.strip().strip(';:,()[]').lower()
+        return s or None
+
+    res = {'result': None, 'smtp_mailfrom': None, 'helo': None, 'ip': None, 'aligned': None}
+
+    for ar in authres_list:
+        for (k, v) in ar.get('spf') or []:
+            if v in ('pass', 'softfail', 'fail', 'neutral', 'none', 'temperror', 'permerror'):
+                res['result'] = v
+        kv = ar.get('kv') or {}
+        for key in ('smtp.mailfrom', 'mailfrom', 'envelope-from'):
+            if kv.get(key):
+                res['smtp_mailfrom'] = kv.get(key)
+                break
+        if kv.get('smtp.helo'):
+            res['helo'] = kv.get('smtp.helo')
+        if kv.get('smtp.client-ip'):
+            res['ip'] = kv.get('smtp.client-ip')
+        if res['result']:
+            break
+
+    # Fallback a Received-SPF solo si tenemos el objeto Message
+    if not res['result'] and msg is not None:
+        res['result'] = extract_received_spf(msg)
+
+    # Dominio autenticado por SPF (MailFrom o HELO)
+    mf_dom = _extract_domain(res['smtp_mailfrom'])
+    helo_dom = _extract_domain(res['helo'])
+    spf_dom = mf_dom or helo_dom
+
+    if from_dom and spf_dom:
+        from_org = _org_domain(from_dom)
+        spf_org = _org_domain(spf_dom)
+        res['aligned'] = (
+            from_dom.lower() == spf_dom.lower() or
+            (from_org and spf_org and from_org == spf_org)
+        )
+    else:
+        res['aligned'] = False
+
+    return res
+
+def evaluate_dmarc(authres_list, from_header):
+    """
+    Usa Authentication-Results: dmarc=pass/fail; header.from=dom;
+    Retorna dict: {'result','header_from','policy','aligned_spf_or_dkim'}
+    """
+    out = {'result': None, 'header_from': None, 'policy': None, 'aligned_spf_or_dkim': None}
+    for ar in authres_list:
+        kv = ar.get('kv') or {}
+        if kv.get('dmarc'):
+            # a veces aparece 'dmarc=pass' como par básico; _parse_authres_line ya lo añadió a kv
+            val = kv.get('dmarc')
+            if val in ('pass', 'fail'):
+                out['result'] = val
+        # Campos comunes: header.from=, policy=, p=...
+        for key in ('header.from', 'from.header', 'h.from'):
+            if kv.get(key):
+                out['header_from'] = kv.get(key).lower()
+                break
+        for key in ('policy.p', 'p', 'disposition', 'policy'):
+            if kv.get(key) and not out['policy']:
+                out['policy'] = kv.get(key).lower()
+
+        # A veces añade pistas: dmarc=pass (p=none) header.from=dom
+        if out['result']:
+            break
+
+    # Alineamiento: si dmarc=pass asumimos que o SPF o DKIM alineó
+    if out['result'] == 'pass':
+        out['aligned_spf_or_dkim'] = True
+    elif out['result'] == 'fail':
+        out['aligned_spf_or_dkim'] = False
+
+    # Si no hay header_from en AR, derivamos de From:
+    if not out['header_from']:
+        out['header_from'] = _find_header_from_domain(from_header)
+
+    return out
+
+def parse_arc_chain(msg):
+    """
+    Recolecta ARC-Seal, ARC-Message-Signature y ARC-Authentication-Results.
+    Determina instancias por i=, verifica completitud por índice (1..max(i)),
+    y obtiene last_cv como el cv del mayor i presente (no por orden de cabeceras).
+    """
+    import re
+    seals = msg.get_all('ARC-Seal') or []
+    ams   = msg.get_all('ARC-Message-Signature') or []
+    aar   = msg.get_all('ARC-Authentication-Results') or []
+
+    def _i_list(values):
+        out = []
+        for raw in values:
+            m = re.search(r'\bi\s*=\s*([0-9]+)', u_(raw))
+            if m:
+                try:
+                    out.append(int(m.group(1)))
+                except:
+                    pass
+        return sorted(set(out))
+
+    def _i_to_cv_map(seals_list):
+        d = {}
+        for raw in seals_list:
+            i_m = re.search(r'\bi\s*=\s*([0-9]+)', u_(raw))
+            if not i_m:
+                continue
+            try:
+                i = int(i_m.group(1))
+            except:
+                continue
+            cv_m = re.search(r'\bcv\s*=\s*([a-zA-Z]+)', u_(raw))
+            if cv_m:
+                d[i] = cv_m.group(1).strip().lower()
+        return d
+
+    i_seal = _i_list(seals)
+    i_ams  = _i_list(ams)
+    i_aar  = _i_list(aar)
+
+    instances = sorted(set(i_seal) | set(i_ams) | set(i_aar))
+    complete = False
+    if instances:
+        expected = list(range(1, max(instances) + 1))
+        # completitud: todos los i presentes y cada i aparece en las 3 familias
+        if instances == expected:
+            complete = all(i in i_seal for i in expected) and \
+                       all(i in i_ams  for i in expected) and \
+                       all(i in i_aar  for i in expected)
+
+    # last_cv = cv del mayor i presente en ARC-Seal
+    cv_map = _i_to_cv_map(seals)
+    last_cv = None
+    if cv_map:
+        last_cv = cv_map.get(max(cv_map.keys())) or None
+
+    return {
+        'instances': instances,
+        'complete': bool(complete),
+        'last_cv': last_cv or 'none',
+        'count': len(instances)
+    }
+
+
+def summarize_auth_policies(spf_res, dmarc_res, arc_res, from_header):
+    """
+    Texto + puntuación para Analysis Results (SPF/DMARC/ARC).
+    """
+    if not spf_res.get('result') and not dmarc_res.get('result') and not arc_res.get('count'):
+        return ("No se encontraron evidencias de autenticación SPF, DMARC ni ARC.", 10) # 10 puntos para enseñar que no hay nada de autenticacion
+
+    parts = []
+    score = 0
+    from_dom = _find_header_from_domain(from_header)
+
+    parts.append("Identidad From: {}".format(from_dom or "AUSENTE"))
+    parts.append("\n--- SPF ---")
+    parts.append("Resultado: {}".format(spf_res.get('result') or "desconocido"))
+    if spf_res.get('smtp_mailfrom'):
+        parts.append("smtp.mailfrom: {}".format(spf_res['smtp_mailfrom']))
+    if spf_res.get('ip'):
+        parts.append("client-ip: {}".format(spf_res['ip']))
+    parts.append("Alineación organizativa SPF↔From: {}".format("ALIGNED" if spf_res.get('aligned') else "MISALIGNED"))
+
+    # Scoring SPF
+    r = (spf_res.get('result') or '').lower()
+    if r == 'pass':
+        pass
+    elif r in ('softfail', 'neutral', 'none'):
+        score += 10
+    elif r in ('fail', 'permerror'):
+        score += 40
+    elif r == 'temperror':
+        score += 5
+    if spf_res.get('aligned') is False and r == 'pass':
+        # SPF pasa pero no alinea → útil para DMARC
+        parts.append("Nota: SPF=pass pero dominio no alineado (no cumple DMARC por SPF).")
+        score += 10
+
+    parts.append("\n--- DMARC ---")
+    parts.append("Resultado: {}".format(dmarc_res.get('result') or "desconocido"))
+    if dmarc_res.get('policy'):
+        parts.append("Política: {}".format(dmarc_res['policy']))
+    if dmarc_res.get('header_from'):
+        parts.append("header.from (AR): {}".format(dmarc_res['header_from']))
+    if dmarc_res.get('result') == 'fail':
+        score += 50
+
+    parts.append("\n--- ARC ---")
+    parts.append("Instancias: {}".format(arc_res.get('count') or 0))
+    parts.append("Cadena completa: {}".format("Sí" if arc_res.get('complete') else "No"))
+    parts.append("Último ARC-Seal cv: {}".format(arc_res.get('last_cv') or "none"))
+    if arc_res.get('count', 0) > 0 and arc_res.get('last_cv') == 'fail':
+        score += 30
+        parts.append("ALERTA: cv=fail en el último sello ARC (cadena no confiable).")
+
+    return "\n".join(parts), int(score)
+
+# === External Auth Policies (SPF/DMARC/ARC) active checker ===
+
+def _find_external_auth_script():
+    base = os.path.dirname(os.path.abspath(__file__))  # core directory
+    candidate = os.path.join(base, "tfm_auth_policies_check.py")
+    return os.path.normpath(candidate) if os.path.exists(candidate) else None
+
+def run_external_auth_policies(raw_bytes, timeout=15):
+    """
+    Lanza tfm_auth_policies_check.py (Python3) pasando el EML completo por stdin.
+    Devuelve dict JSON o eleva excepción si hay error duro/timeout.
+    """
+    script = _find_external_auth_script()
+    if not script:
+        raise Exception("Auth policies script not found (core\tfm_auth_policies_check.py)")
+    pyexe = _find_python_exe_for_tools() if "_find_python_exe_for_tools" in globals() else "python"
+    cmd = [pyexe, script]
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except Exception as e:
+        raise Exception("Failed to start auth checker: {}".format(e))
+    try:
+        if raw_bytes is None:
+            raw_bytes = b""
+        try:
+            if isinstance(raw_bytes, unicode):  # Jython
+                raw_bytes = raw_bytes.encode('utf-8', 'ignore')
+        except NameError:
+            if isinstance(raw_bytes, str):
+                raw_bytes = raw_bytes.encode('utf-8', 'ignore')
+        proc.stdin.write(raw_bytes); proc.stdin.flush(); proc.stdin.close()
+    except Exception:
+        pass
+    start = time.time()
+    while True:
+        rc = proc.poll()
+        if rc is not None:
+            break
+        if (time.time() - start) > timeout:
+            try: proc.kill()
+            except Exception: pass
+            raise Exception("Auth policies script timeout")
+        time.sleep(0.2)
+    try:
+        out = proc.stdout.read()
+    except Exception:
+        out = b""
+    try:
+        err = proc.stderr.read()
+    except Exception:
+        err = b""
+    if rc not in (0, 2):
+        raise Exception("Auth policies checker failed (rc={}): {}".format(rc, (err or b"").decode('utf-8','ignore')))
+    try:
+        return json.loads((out or b"").decode('utf-8','ignore'))
+    except Exception as e:
+        raise Exception("Invalid JSON from auth policies checker: {}".format(e))
