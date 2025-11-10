@@ -37,12 +37,13 @@ class TFMEmailHeadersModule(FileIngestModule):
 
         msg   = email.message_from_string(content)
         frm   = core.decode_mime_header(msg.get('From',''))
-        to    = core.decode_mime_header(msg.get('To',''))
+        to    = core.best_recipient(msg)
         subj  = core.decode_mime_header(msg.get('Subject',''))
         msgid = core.decode_mime_header(msg.get('Message-ID',''))
         date_sent = core.decode_mime_header(msg.get('Date',''))
         ts_sent = core.date_to_epoch(date_sent)
         ts_rcvd = core.date_to_epoch(core.u_(msg.get('X-Received-Date',''))) or ts_sent
+
 
         art = f.newArtifact(BlackboardArtifact.ARTIFACT_TYPE.TSK_EMAIL_MSG)
         attrs = [

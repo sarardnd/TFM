@@ -35,64 +35,6 @@ def decode_mime_header(val):
                 except:
                     parts.append(unicode(b, "latin-1", "ignore"))
     return u"".join(parts)
-# --- Helpers de destinatarios ---
-def _decode_addrlist(pairs):
-    """
-    Decodifica [(name, addr)] -> lista de strings legibles "Nombre <addr>" o "addr".
-    """
-    out = []
-    for nm, addr in pairs:
-        nm_dec = decode_mime_header(nm) if nm else u""
-        addr_u  = u_(addr) if addr else u""
-        if nm_dec and addr_u:
-            out.append(u"%s <%s>" % (nm_dec, addr_u))
-        elif addr_u:
-            out.append(addr_u)
-        elif nm_dec:
-            out.append(nm_dec)
-    return out
-
-def best_recipient(msg):
-    """
-    Devuelve un string con los destinatarios 'mejores' para mostrar:
-    - Prioriza To, luego Resent-To, Delivered-To, X-Original-To, Envelope-To.
-    - Soporta múltiples cabeceras y múltiples direcciones por cabecera.
-    - Deduplica manteniendo el orden.
-    """
-    try:
-        # Py2/Jython: getaddresses está en email.Utils
-        import email.Utils as EUtils
-    except:
-        import email.utils as EUtils  # fallback por si acaso
-
-    candidate_headers = [
-        'To', 'Resent-To', 'Delivered-To', 'X-Original-To', 'Envelope-To'
-    ]
-
-    seen = set()
-    ordered = []
-
-    for h in candidate_headers:
-        raw_vals = msg.get_all(h)
-        if not raw_vals:
-            continue
-        # Puede haber múltiples cabeceras y múltiples direcciones por cabecera
-        addrs = []
-        for raw in raw_vals:
-            try:
-                addrs.extend(EUtils.getaddresses([u_(raw)]))
-            except:
-                # Si falla el parseo, al menos añade la cadena cruda
-                addrs.append((u"", u_(raw)))
-
-        decoded = _decode_addrlist(addrs)
-        for item in decoded:
-            key = item.strip().lower()
-            if key and key not in seen:
-                seen.add(key)
-                ordered.append(item)
-
-    return u", ".join(ordered)
 
 def date_to_epoch(date_str):
     """Convierte 'Date:' a epoch (segundos)."""
@@ -1055,91 +997,82 @@ def _find_external_dkim_script():
 
 def run_external_dkim_check(raw_bytes, timeout=15):
     """
-    Lanza el checker Python3 externo pasando la RUTA de un archivo temporal
-    con los bytes crudos. Evita problemas de stdin en Jython.
+    Lanza el checker Python3 externo pasando raw_bytes por stdin.
+    Sin usar subprocess.TimeoutExpired (no existe en Jython).
+    Implementa timeout propio con poll().
     """
     script = _find_external_dkim_script()
     if not script:
-        raise Exception("DKIM script not found (core\\tfm_dkim_check.py)")
+        raise Exception("DKIM script not found (core\tfm_dkim_check.py)")
     pyexe = _find_python_exe_for_tools()
+    cmd = [pyexe, script]
 
-    import tempfile, os, subprocess, time, json
-    fd, tmppath = tempfile.mkstemp(prefix="tfm_dkim_", suffix=".eml")
+    # Abrimos el proceso con pipes
     try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except Exception as e:
+        raise Exception("Failed to start checker: {}".format(e))
+
+    # Escribir stdin de forma segura en Jython
+    try:
+        if raw_bytes is None:
+            raw_bytes = b""
+        # En Jython, 'bytes' puede no existir; aseguramos tipo 'str' binaria
         try:
-            os.write(fd, raw_bytes if raw_bytes else b"")
-        finally:
-            os.close(fd)
+            # si ya son bytes, OK; si es unicode, codifica
+            if isinstance(raw_bytes, unicode):  # Jython
+                raw_bytes = raw_bytes.encode('utf-8', 'ignore')
+        except NameError:
+            # En CPython no hay 'unicode'
+            if isinstance(raw_bytes, str):
+                raw_bytes = raw_bytes.encode('utf-8', 'ignore')
 
-        cmd = [pyexe, script, "--file", tmppath]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc.stdin.write(raw_bytes)
+        proc.stdin.flush()
+        proc.stdin.close()
+    except Exception:
+        # si falla la escritura, intentaremos igualmente leer/terminar
+        pass
 
-        start = time.time()
-        while True:
-            rc = proc.poll()
-            if rc is not None:
-                break
-            if (time.time() - start) > timeout:
-                try:
-                    proc.kill()
-                except:
-                    pass
-                raise Exception("DKIM script timeout")
-            time.sleep(0.2)
+    # Emular timeout: espera activa con poll()
+    start = time.time()
+    interval = 0.2
+    while True:
+        rc = proc.poll()
+        if rc is not None:
+            break
+        if (time.time() - start) > timeout:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            raise Exception("DKIM script timeout (poll emulation, no TimeoutExpired in Jython)")
+        time.sleep(interval)
 
-        out = proc.stdout.read() or b""
-        err = proc.stderr.read() or b""
+    # Proceso terminó: lee stdout/stderr
+    try:
+        out = proc.stdout.read()
+    except Exception:
+        out = b""
+    try:
+        err = proc.stderr.read()
+    except Exception:
+        err = b""
 
-        if rc not in (0, 2):
-            raise Exception("DKIM checker failed (rc={}): {}".format(rc, err.decode('utf-8','ignore')))
+    # Manejo de códigos de retorno (el script usa rc=2 para deps faltantes)
+    if rc not in (0, 2):
+        raise Exception("DKIM checker failed (rc={}): {}".format(rc, (err or b"").decode('utf-8', 'ignore')))
 
-        return json.loads(out.decode('utf-8','ignore'))
-    finally:
-        try:
-            os.remove(tmppath)
-        except:
-            pass
-
-def _diagnose_dkim_variants(variants):
-    """
-    Recibe la lista de variantes del verificador externo y devuelve
-    un diagnóstico humano-leyible del motivo probable del fallo/pase.
-    """
-    if not variants:
-        return "Sin variantes reportadas (verificador externo no devolvió detalles)."
-
-    # Map rápidos para inspección
-    by = {v.get("variant"): v for v in variants}
-    raw_ok   = bool(by.get("raw", {}).get("verified"))
-    lf_ok    = bool(by.get("lf_to_crlf", {}).get("verified"))
-    eof_ok   = bool(by.get("crlf_ensure_eof", {}).get("verified"))
-
-    # Errores explícitos
-    errors = [v for v in variants if v.get("error")]
-    if errors and not (raw_ok or lf_ok or eof_ok):
-        # devuelve el primer error visible
-        e = errors[0]
-        return u"Error de verificación en '{}': {}".format(e.get("variant"), e.get("error"))
-
-    if raw_ok:
-        return "RAW=OK → los bytes del .eml son íntegros; al menos una firma verifica."
-
-    # Patrones de fallo típicos por EOL
-    if (not raw_ok) and lf_ok and (not eof_ok):
-        return "Fallo por EOL: el archivo venía con \\n (LF) sueltos; tras normalizar a CRLF verifica."
-    if (not raw_ok) and eof_ok and (not lf_ok):
-        return "Fallo por EOL final: faltaba CRLF final tras el cuerpo/boundary; al añadirlo verifica."
-    if (not raw_ok) and lf_ok and eof_ok:
-        return "Fallo por EOL/terminación: combinación de \\n sueltos y ausencia de CRLF final."
-
-    # Si ninguna variante verifica
-    return "Ninguna variante verifica: posible alteración del cuerpo/cabeceras o dependencia del entorno."
-
+    # Parsear JSON
+    try:
+        return json.loads((out or b"").decode('utf-8', 'ignore'))
+    except Exception as e:
+        raise Exception("Invalid JSON from DKIM checker: {}".format(e))
+    
 def summarize_external_dkim_result(dkim_json):
     """
     Convierte la estructura retornada por run_external_dkim_check() a
-    un string compacto y puntuación para Analysis Results, incluyendo
-    el detalle de variantes para diagnosticar por qué falla/pasa.
+    un string compacto y puntuación para Analysis Results.
     """
     if not dkim_json:
         return ("No hay resultado DKIM (error interno).", 50)
@@ -1150,88 +1083,55 @@ def summarize_external_dkim_result(dkim_json):
     parts = []
     score = 0
 
-    sig_count = int(dkim_json.get('dkim_signatures_count', 0))
-    parts.append("DKIM signatures: {}".format(sig_count))
+    # parts.append("From: {}".format(dkim_json.get('from_header') or "AUSENTE"))
+    parts.append("DKIM signatures: {}".format(dkim_json.get('dkim_signatures_count', 0)))
 
-    # --- Detalle de firmas (DNS/alineación) ---
-    aligned_any = False
-    dns_ok_any = False
-    for i, s in enumerate(dkim_json.get('signatures', [])):
-        d = s.get('d') or '-'
-        sel = s.get('s') or '-'
-        align = s.get('alignment') or 'UNKNOWN'
-        sel_ok = bool(s.get('selector_dns_ok'))
-        if align == 'ALIGNED': aligned_any = True
-        if sel_ok: dns_ok_any = True
+    verify = dkim_json.get('verify', {})
+    aligned_any = any(s.get('alignment') == 'ALIGNED' for s in dkim_json.get('signatures', []))
+    dns_ok_any  = any(s.get('selector_dns_ok') for s in dkim_json.get('signatures', []))
+    usually     = bool(dkim_json.get('domain_usually_signs'))
+    if verify.get('verify_attempted'):
+        if verify.get('verified'):
+            parts.append("Verificación criptográfica: OK (al menos una firma verificó).")
+        else:
+            parts.append("Verificación criptográfica: FALLIDA. Error: {}".format(verify.get('verify_error')))
+            score += 20
+            if dns_ok_any and aligned_any and usually: # Heurística de manipulación:
+                parts.append("Indicador fuerte: Selector DNS OK, alineación ALIGNED y el dominio suele firmar → "
+                             "la copia parece ALTERADA (cambios en cabeceras/cuerpo/EOL).")
+                score += 30
+    else:
+        parts.append("Verificación criptográfica: NO REALIZADA (fallo en el entorno).")
+        score += 40
 
-        parts.append("\n- Firma #{}: d={} s={}".format(i+1, d, sel))
-        parts.append("  alignment={}".format(align))
-        if not sel_ok:
+    # Por cada firma, resumir estado DNS/alignment
+    for i, s in enumerate(dkim_json.get('signatures', []) ):
+        parts.append("\n- Firma #{}: d={} s={}".format(i+1, s.get('d') or '-', s.get('s') or '-'))
+        parts.append("  alignment={}".format(s.get('alignment') or 'UNKNOWN'))
+        if not s.get('selector_dns_ok'):
             parts.append("  selector DNS: NO encontrado")
             score += 15
         else:
+            # si txt presente, comprobar mínimo
             txts = s.get('selector_txt') or []
-            parts.append("  selector DNS: encontrado ({} records)".format(len(txts) if isinstance(txts, list) else 1))
+            if not txts:
+                parts.append("  selector DNS: encontrado pero sin TXT legible")
+                score += 10
+            else:
+                parts.append("  selector DNS: encontrado ({} records)".format(len(txts)))
 
-        if align == "MISALIGNED":
+        if s.get('alignment') == 'MISALIGNED':
             parts.append("  Nota: dominio DKIM distinto del dominio From: (MISALIGNED)")
             score += 25
 
-    # --- Variantes de verificación (triage) ---
-    verify = dkim_json.get('verify', {}) or {}
-    variants = verify.get('variants') or []
-
-    # Línea compacta de estado por variante
-    if variants:
-        compact = []
-        for v in variants:
-            tag = v.get('variant', '?')
-            if v.get('verified'):
-                compact.append("{}=OK".format(tag))
-            else:
-                compact.append("{}={}".format(tag, "ERR" if v.get('error') and not v.get('attempted') else "NO"))
-        parts.append("\nVerificación (variantes): " + ", ".join(compact))
-
-        # Diagnóstico legible
-        diag = _diagnose_dkim_variants(variants)
-        parts.append("Diagnóstico: " + diag)
-
-        # Puntuación según resultado global
-        if any(v.get('verified') for v in variants):
-            parts.append("Verificación criptográfica: OK (al menos una variante verificó).")
-        else:
-            parts.append("Verificación criptográfica: FALLIDA (ninguna variante verificó).")
-            score += 20
-            # Heurística de “copia alterada” solo si hay indicios sólidos
-            usually = bool(dkim_json.get('domain_usually_signs'))
-            if dns_ok_any and aligned_any and usually:
-                parts.append("Indicador fuerte: Selector DNS OK, alineación ALIGNED y el dominio suele firmar → posible alteración de bytes (EOL/cuerpo).")
-                score += 30
-    else:
-        # Compatibilidad con versiones antiguas del checker
-        if verify.get('verify_attempted'):
-            if verify.get('verified'):
-                parts.append("Verificación criptográfica: OK.")
-            else:
-                parts.append("Verificación criptográfica: FALLIDA. Error: {}".format(verify.get('verify_error')))
-                score += 20
-                usually = bool(dkim_json.get('domain_usually_signs'))
-                if dns_ok_any and aligned_any and usually:
-                    parts.append("Indicador fuerte: Selector DNS OK, alineación ALIGNED y el dominio suele firmar → posible alteración de bytes (EOL/cuerpo).")
-                    score += 30
-        else:
-            parts.append("Verificación criptográfica: NO REALIZADA (fallo en el entorno).")
-            score += 40
-
-    # Contexto de whitelist (informativo)
     if dkim_json.get('domain_usually_signs'):
         parts.append("\nContexto: Dominio del remitente suele firmar (whitelist).")
     else:
         parts.append("\nContexto: Dominio no marcado como 'suele firmar' en whitelist.")
+        # no puntuar fuerte, solo informativo
 
     if score == 0:
         parts.append("\nResumen: DKIM OK / sin problemas detectados por el verificador externo.")
-
     return ("\n".join(parts), int(score))
 
 # ==== SPF / DMARC / ARC (parsers & evaluators) ====

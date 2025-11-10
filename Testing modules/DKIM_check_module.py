@@ -6,6 +6,7 @@ import jarray, email
 from org.sleuthkit.autopsy.ingest import IngestModule, FileIngestModule, IngestModuleFactoryAdapter, IngestMessage, IngestServices
 from org.sleuthkit.autopsy.casemodule import Case
 from org.sleuthkit.datamodel import BlackboardArtifact, BlackboardAttribute, ReadContentInputStream
+from java.io import ByteArrayOutputStream  # <-- AÑADIDO
 
 import sys, os
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -16,7 +17,7 @@ if CORE_PATH not in sys.path:
 import tfm_email_core as core
 
 MODULE_NAME = u"TFM Email DKIM Inspector"
-MODULE_VER  = u"1.0"
+MODULE_VER  = u"1.1"  # <-- sube versión para identificar cambios
 
 class TFMEmailDKIMFactory(IngestModuleFactoryAdapter):
     moduleName = MODULE_NAME
@@ -27,30 +28,36 @@ class TFMEmailDKIMFactory(IngestModuleFactoryAdapter):
     def createFileIngestModule(self, settings): return TFMEmailDKIMModule()
 
 class TFMEmailDKIMModule(FileIngestModule):
+
+    def _read_raw_bytes(self, f):
+        """Lee el EML en bytes crudos, sin recodificar ni tocar EOL."""
+        istream = ReadContentInputStream(f)
+        baos = ByteArrayOutputStream()
+        buf = jarray.zeros(8192, 'b')
+        while True:
+            n = istream.read(buf)
+            if n < 0:
+                break
+            baos.write(buf, 0, n)
+        return baos.toByteArray()  # Java byte[]
+
     def process(self, f):
         name = f.getName()
         if (not f.isFile()) or (not name or not name.lower().endswith(".eml")):
             return IngestModule.ProcessResult.OK
         try:
-            istream = ReadContentInputStream(f)
-            buf = jarray.zeros(int(f.getSize()), 'b')
-            istream.read(buf)
-            content = buf.tostring()
-            if not content:
-                return IngestModule.ProcessResult.OK
+            # --- BYTES CRUDOS ---
+            raw_bytes = self._read_raw_bytes(f)
 
-            msg = email.message_from_string(content)
-
-            from_header = msg.get('From')
+            # Parse SOLO para UI/textos (NO usar para verificar DKIM)
+            try:
+                msg = email.message_from_string(raw_bytes.tostring())
+            except:
+                msg = None
+            from_header = msg.get('From') if msg else u""
 
             try:
-                # Tenemos el contenido 'content' (string) — convertimos a bytes para enviar al script externo
-                # En Jython el tipo puede ser str; forzamos codificación utf-8 con ignore
-                if isinstance(content, unicode):
-                    raw_bytes = content.encode('utf-8', 'ignore')
-                else:
-                    raw_bytes = str(content).encode('utf-8', 'ignore')
-
+                # Pasa los bytes crudos al verificador externo (core usa archivo temp)
                 dkim_json = core.run_external_dkim_check(raw_bytes, timeout=15)
                 summary, score = core.summarize_external_dkim_result(dkim_json)
 
@@ -58,10 +65,11 @@ class TFMEmailDKIMModule(FileIngestModule):
                 IngestServices.getInstance().postMessage(
                     IngestMessage.createMessage(IngestMessage.MessageType.ERROR, MODULE_NAME, core.u_("DKIM external error: {}".format(e)))
                 )
-                # Fallback: usar parseo local si el external falla
+                # Fallback: análisis estructural sin cripto
+                if msg is None:
+                    msg = email.message_from_string(raw_bytes.tostring())
                 parsed_dkim = core.parse_dkim_headers(msg)
-                summary, score = core.summarize_dkim_findings(parsed_dkim, from_header)
-
+                summary, score = core.summarize_dkim_findings(parsed_dkim, from_header or u"")
 
             self._hit(f, u"DKIM analysis", summary, score)
             return IngestModule.ProcessResult.OK

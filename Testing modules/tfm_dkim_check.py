@@ -2,19 +2,19 @@
 # -*- coding: utf-8 -*-
 """
 tfm_dkim_check.py
-Lee un mensaje EML desde stdin (raw bytes) y:
- - intenta verificar DKIM (usando dkimpy)
- - consulta selector DNS (selector._domainkey.domain) con dnspython
- - reporta alineamiento d= vs From:
- - indica si el dominio está en una whitelist local (dominios que suelen firmar)
+Lee un mensaje EML desde --file (o stdin si no se pasa) y:
+ - intenta verificar DKIM (dkimpy)
+ - consulta selector DNS (dnspython)
+ - reporta alineación d= vs From:
+ - indica si el dominio está en whitelist local
 Salida: JSON en stdout
 """
 from __future__ import annotations
-import sys, json, re, os
+import sys, json, re, os, argparse
 from email import policy
 from email.parser import BytesParser
 
-# Dependencias: dkim (dkimpy), dns.resolver (dnspython)
+# Dependencias
 try:
     import dkim
     import dns.resolver
@@ -22,12 +22,16 @@ except Exception as e:
     sys.stdout.write(json.dumps({"error": "missing_dependency", "msg": str(e)}))
     sys.exit(2)
 
-# Ajustes
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-WHITELIST_FILE = os.path.join(BASE_DIR, "dkim_whitelist.txt")  # opcional
+WHITELIST_FILE = os.path.join(BASE_DIR, "dkim_whitelist.txt")
 
 DKIM_SIG_RE = re.compile(r'\bd=([^;\s]+)', re.I)
 SELECTOR_RE = re.compile(r'\bs=([^;\s]+)', re.I)
+
+# -------- CLI
+ap = argparse.ArgumentParser(add_help=False)
+ap.add_argument("--file", dest="file", default=None)
+args, _ = ap.parse_known_args()
 
 def read_whitelist(path):
     if not os.path.exists(path):
@@ -46,11 +50,9 @@ def read_whitelist(path):
 def get_domain_from_from_header(from_hdr):
     if not from_hdr:
         return None
-    # intentar extraer lo que hay detrás de '@'
     m = re.search(r'@([A-Za-z0-9.\-]+)', from_hdr)
     if m:
         return m.group(1).lower()
-    # fallback: coger el último token con punto
     parts = from_hdr.split()
     for p in reversed(parts):
         if '.' in p:
@@ -60,20 +62,17 @@ def get_domain_from_from_header(from_hdr):
 def org_domain_simple(host):
     if not host: return host
     parts = host.split('.')
-    if len(parts) >= 2:
-        return '.'.join(parts[-2:])
-    return host
+    return '.'.join(parts[-2:]) if len(parts) >= 2 else host
 
 def extract_dkim_headers(msg):
-    vals = msg.get_all('DKIM-Signature') or []
-    return vals
+    return msg.get_all('DKIM-Signature') or []
 
 def parse_sig_params(sig_text):
-    # divide por ';' y extrae pares k=v
     parts = re.split(r';\s*', sig_text)
     d=None; s=None
     for p in parts:
-        if p.strip() == '': continue
+        if p.strip() == '': 
+            continue
         m = re.match(r'\s*d\s*=\s*([^;\s]+)', p, re.I)
         if m: d = m.group(1)
         m2 = re.match(r'\s*s\s*=\s*([^;\s]+)', p, re.I)
@@ -85,7 +84,6 @@ def dns_txt_lookup(fqdn):
         answers = dns.resolver.resolve(fqdn, 'TXT', lifetime=5.0)
         txts = []
         for r in answers:
-            # r.strings is list of bytes in py3; join them
             try:
                 if hasattr(r, 'strings'):
                     txts.append(b"".join(r.strings).decode('utf-8', 'ignore'))
@@ -97,41 +95,42 @@ def dns_txt_lookup(fqdn):
     except Exception as e:
         return False, str(e)
 
-def verify_dkim(raw_bytes):
-    """
-    Usa dkim.verify(raw_bytes). dkim.verify devuelve True si al menos
-    una firma verifica (por defecto). Para más granularidad
-    podríamos usar dkim.signatures() / dkim._get_signature(...), pero
-    dkim.verify es suficiente para el objetivo práctico.
-    """
+# ---- Variantes de verificación para diagnóstico
+def normalize_lf_to_crlf(b):
+    # Convierte a '\n' primero para evitar duplicar CR
+    return b.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+
+def ensure_final_crlf(b):
+    return b if b.endswith(b"\r\n") else (b + b"\r\n")
+
+def verify_variant(label, raw):
     try:
-        ok = dkim.verify(raw_bytes)
-        return True, bool(ok), None
+        ok = dkim.verify(raw)
+        return {"variant": label, "attempted": True, "verified": bool(ok), "error": None}
     except Exception as e:
-        return False, False, str(e)
+        return {"variant": label, "attempted": False, "verified": False, "error": str(e)}
+
+def read_raw():
+    if args.file:
+        with open(args.file, "rb") as fh:
+            return fh.read()
+    return sys.stdin.buffer.read()
 
 def main():
-    raw = sys.stdin.buffer.read()
+    raw = read_raw()
     if not raw:
-        print(json.dumps({"error": "no_input"}))
-        return
+        print(json.dumps({"error": "no_input"})); return
 
-    # parseamos el mensaje (solo headers suficientes aquí)
+    # Parse headers para contexto (no re-serializar)
     try:
         msg = BytesParser(policy=policy.default).parsebytes(raw)
     except Exception:
-        # fallback a parsing más permisivo
         from email.parser import Parser
-        try:
-            txt = raw.decode('utf-8', 'ignore')
-            msg = Parser().parsestr(txt)
-        except Exception as e:
-            print(json.dumps({"error": "parse_error", "msg": str(e)}))
-            return
+        msg = Parser().parsestr(raw.decode('utf-8','ignore'))
 
     from_hdr = msg.get('From') or msg.get('from') or ""
     from_dom = get_domain_from_from_header(from_hdr)
-    from_org = org_domain_simple(from_dom)
+    from_org = org_domain_simple(from_dom) if from_dom else None
 
     signatures = extract_dkim_headers(msg)
     whitelist = read_whitelist(WHITELIST_FILE)
@@ -140,7 +139,6 @@ def main():
     for sig in signatures:
         d, s = parse_sig_params(sig)
         entry = {"raw": sig, "d": d, "s": s}
-        # DNS selector check
         if s and d:
             fqdn = "{}._domainkey.{}".format(s, d)
             dns_ok, dns_val = dns_txt_lookup(fqdn)
@@ -149,37 +147,35 @@ def main():
         else:
             entry["selector_dns_ok"] = False
             entry["selector_txt"] = []
-
-        # alignment: org domain compare
         if d and from_dom:
             entry["alignment"] = "ALIGNED" if org_domain_simple(d) == from_org else "MISALIGNED"
         else:
             entry["alignment"] = "UNKNOWN"
-
         results.append(entry)
 
-    # verification (cryptographic) — dkim.verify on whole message
-    ok_env, verified_flag, verify_err = verify_dkim(raw)
-    verify_info = {
-        "verify_attempted": ok_env,
-        "verified": verified_flag,
-        "verify_error": verify_err
-    }
+    # — Verificación (triage)
+    variants = [
+        verify_variant("raw", raw),
+        verify_variant("lf_to_crlf", normalize_lf_to_crlf(raw)),
+        verify_variant("crlf_ensure_eof", ensure_final_crlf(raw)),
+    ]
+    verified_any = any(v["verified"] for v in variants)
+    attempted_any = any(v["attempted"] for v in variants)
 
-    # mark domain usually signing (whitelist)
-    domain_signs = False
-    if from_dom and from_dom.lower() in whitelist:
-        domain_signs = True
+    domain_signs = bool(from_dom and whitelist and from_dom.lower() in whitelist)
 
     out = {
-        "from_header": from_hdr if from_hdr else None,
+        "from_header": from_hdr or None,
         "from_domain": from_dom,
         "dkim_signatures_count": len(signatures),
         "signatures": results,
-        "verify": verify_info,
+        "verify": {
+            "verify_attempted": attempted_any,
+            "verified": verified_any,
+            "variants": variants
+        },
         "domain_usually_signs": domain_signs,
     }
-
     print(json.dumps(out, ensure_ascii=False))
 
 if __name__ == "__main__":
