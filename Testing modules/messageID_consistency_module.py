@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# tfm_email_msgid_module.py — Detect duplicates or built Message-ID (Jython / Autopsy 4.22.x)
+# messageID_consistency_module.py
 
 import jarray, email, os, sys
 from org.sleuthkit.autopsy.ingest import IngestModule, FileIngestModule, IngestModuleFactoryAdapter
@@ -14,16 +14,15 @@ if CORE_PATH not in sys.path:
 import tfm_email_core as core
 
 MODULE_NAME = u"TFM Email Message-ID"
-MODULE_VER  = u"1.2"
+MODULE_VER  = u"1.0"
 
-# Usamos SIEMPRE el mismo set name para este módulo
 ANALYSIS_SET_NAME = u"Message-ID analysis"
 
 
 class TFMMessageIDFactory(IngestModuleFactoryAdapter):
     moduleName = MODULE_NAME
     def getModuleDisplayName(self): return self.moduleName
-    def getModuleDescription(self): return u"Detecta Message-ID duplicados o con formato/sitios sospechosos."
+    def getModuleDescription(self): return u"Detects duplicates Message-IDs or suspicious formats."
     def getModuleVersionNumber(self): return MODULE_VER
     def isFileIngestModuleFactory(self): return True
     def createFileIngestModule(self, ingestOptions): return TFMMessageIDModule()
@@ -31,50 +30,52 @@ class TFMMessageIDFactory(IngestModuleFactoryAdapter):
 
 class TFMMessageIDModule(FileIngestModule):
     def startUp(self, context):
-        # Índice de ficheros para poder referenciar en shutDown()
+        # File index to be referenced in shutDown()
         self._file_index = {}            # file_id (long) -> AbstractFile
-        # Acumulador por fichero para fusionar hallazgos (locales + globales)
         # { file_id: { 'parts': [lista de strings], 'score': int } }
         self._agg = {}
         try:
             core.msgid_clear_store()
         except Exception:
-            # En caso de que no exista o falle el store, continuamos
+            # If the store does not exist or fails, we continue
             pass
 
-    # ---- utilidades internas de agregación/emit ----
+    # ---- utilities ----
     def _merge_hit(self, f, desc, value):
-        """Acumula texto de comentario y suma score por fichero."""
+        """Accumulates comments and scores per file."""
         fid = long(f.getId())
         entry = self._agg.setdefault(fid, {'parts': [], 'score': 0})
         if desc:
             udesc = core.u_(desc)
-            if udesc not in entry['parts']:  # evita duplicados de línea
+            if udesc not in entry['parts']:  #avoid duplicates in line
                 entry['parts'].append(udesc)
         try:
             entry['score'] += int(value or 0)
         except Exception:
-            pass  # no bloquear por un cast raro
+            pass  # not blocking because of a rare cast
 
     def _emit_all(self):
-        """Emite exactamente un artifact por fichero con todos los hallazgos fusionados."""
+        """It emits exactly one artifact per file with all the findings merged."""
         try:
             bb = Case.getCurrentCase().getSleuthkitCase().getBlackboard()
-            for fid, data in self._agg.items():
-                f = self._file_index.get(fid)
-                if not f:
-                    continue
-                parts = data.get('parts') or []
-                duplicated = data.get('duplicated', False)
-                if duplicated:
-                    parts = [p for p in parts if not p.strip().startswith(u"Sin anomalías locales")]
+            for fid, f in self._file_index.items():
                 
+                # Buscamos si este archivo tiene datos en el acumulador (_agg)
+                data = self._agg.get(fid)
+                
+                parts = []
+                val = 0
+                
+                if data:
+                    parts = data.get('parts') or []
+                    val   = int(data.get('score') or 0)
+                
+                # Lógica de descripción
                 if not parts:
-                    desc = u"Sin anomalías."
+                    # Si no había datos en _agg, o la lista parts estaba vacía
+                    desc = u"Without anomalies."
                 else:
                     desc = u"\n".join(parts)
-                
-                val  = int(data.get('score') or 0)
 
                 art = f.newArtifact(BlackboardArtifact.ARTIFACT_TYPE.TSK_INTERESTING_FILE_HIT)
                 art.addAttributes([
@@ -84,10 +85,10 @@ class TFMMessageIDModule(FileIngestModule):
                 ])
                 bb.postArtifact(art, MODULE_NAME)
         except Exception:
-            # Evitar que un fallo de publicación rompa el ingest
+            # Prevent a publishing failure from breaking the ingest
             pass
 
-    # ---- pipeline por fichero ----
+    # ---- pipeline per file ----
     def process(self, f):
         name = f.getName()
         if (not f.isFile()) or (not name or not name.lower().endswith(".eml")):
@@ -97,23 +98,23 @@ class TFMMessageIDModule(FileIngestModule):
             fid = long(f.getId())
             self._file_index[fid] = f
 
-            # Leer bytes
+            # Read bytes
             istream = ReadContentInputStream(f)
             buf = jarray.zeros(int(f.getSize()), 'b')
             istream.read(buf)
             content = buf.tostring()
             if not content:
-                self._merge_hit(f, u"Sin contenido legible.", 0)
+                self._merge_hit(f, u"No readable content.", 0)
                 return IngestModule.ProcessResult.OK
 
-            # Parseo
+            # Parsing
             try:
                 msg = email.message_from_string(content)
             except Exception:
-                self._merge_hit(f, u"No se pudo parsear el correo.", 0)
+                self._merge_hit(f, u"The email could not be parsed.", 0)
                 return IngestModule.ProcessResult.OK
 
-            # Headers relevantes
+            # Relevant headers
             from_h = core.decode_mime_header(msg.get('From')) if msg.get('From') else u""
             date_h = msg.get('Date') or u""
             try:
@@ -121,7 +122,7 @@ class TFMMessageIDModule(FileIngestModule):
             except Exception:
                 date_epoch = 0
 
-            # Todas las variantes de Message-ID
+            # Message-ID variants
             raw_headers = []
             for key in ['Message-ID', 'Message-Id', 'Message-id', 'MessageID', 'Messageid']:
                 try:
@@ -133,7 +134,7 @@ class TFMMessageIDModule(FileIngestModule):
                     if v:
                         raw_headers.append(v)
 
-            # dedup de valores de header
+            # dedup header's value
             if raw_headers:
                 seen = set()
                 tmp = []
@@ -144,19 +145,19 @@ class TFMMessageIDModule(FileIngestModule):
                         tmp.append(uh)
                 raw_headers = tmp
 
-            # === Análisis local por archivo ===
+            # === Local analysis per file ===
             local_issues = []
             local_score  = 0
 
             if not raw_headers:
-                local_issues.append(u"Falta cabecera Message-ID.")
+                local_issues.append(u"Missing Message-ID header.")
                 local_score += 30
             else:
                 if len(raw_headers) > 1:
-                    local_issues.append(u"Múltiples cabeceras Message-ID ({})".format(len(raw_headers)))
+                    local_issues.append(u"Multiple Message-ID headers({})".format(len(raw_headers)))
                     local_score += 20
 
-                # candidatos y chequeos de formato/entropía
+                # checking entropy
                 all_candidates = []
                 for raw_mid in raw_headers:
                     cands = core.msgid_extract_candidates(raw_mid)
@@ -168,67 +169,66 @@ class TFMMessageIDModule(FileIngestModule):
                         all_candidates.append((c, raw_mid))
 
                 if not all_candidates:
-                    local_issues.append(u"No se pudieron extraer IDs válidos.")
+                    local_issues.append(u"No valid IDs could be extracted.")
                     local_score += 20
                 else:
                     uniq = set([c for (c, _) in all_candidates])
                     if len(uniq) > 1:
-                        local_issues.append(u"Varias IDs dentro del mismo email ({})".format(len(uniq)))
+                        local_issues.append(u"Many IDs within the same email ({})".format(len(uniq)))
                         local_score += 15
 
                     for (mid, raw_mid) in all_candidates:
-                        # formato básico <>
+                        # basic format <>
                         mid_strip = core.u_(raw_mid).strip()
                         if not (mid_strip.startswith(u'<') and mid_strip.endswith(u'>')):
                             local_issues.append(u"INVALID FORMAT: MISSING <> en: {}".format(raw_mid))
                             local_score += 5
 
-                        # formato RFC y entropía
+                        # format RFC and entropy
                         if not core.msgid_has_valid_format(mid):
-                            local_issues.append(u"Formato sospechoso: {}".format(mid))
+                            local_issues.append(u"Suspicious format: {}".format(mid))
                             local_score += 15
 
                         local = core.msgid_get_local_part(mid)
                         H, H_norm = core.msgid_token_entropy(local)
                         if H_norm < 0.8:
-                            local_issues.append(u"Baja entropía local(Hnorm={:.2f}) en: {}".format(H_norm, mid))
+                            local_issues.append(u"Low local entropy (Hnorm={:.2f}) at: {}".format(H_norm, mid))
                             local_score += 10
 
-                        # Registrar para detección de duplicados global
+                        # Register for global duplicate detection
                         core.msgid_register(mid, f.getId(), name, from_h, date_epoch, raw_mid)
 
-            # Agregar resultado local (no emitimos todavía)
+            # Add local result (we haven't issued it yet)
             if local_issues:
                 desc = u"\n".join(local_issues)
-            else:
-                desc = u"Sin anomalías locales."
-            self._merge_hit(f, desc, int(local_score))
+            # else:
+            #     desc = u""
+                self._merge_hit(f, desc, int(local_score))
 
             return IngestModule.ProcessResult.OK
 
         except Exception:
-            # Evita romper la ingest
+            # Avoid breaking the ingest
             try:
-                self._merge_hit(f, u"Error no controlado durante el análisis.", 0)
+                self._merge_hit(f, u"Uncontrolled error during analysis.", 0)
             except Exception:
                 pass
             return IngestModule.ProcessResult.ERROR
 
     def shutDown(self):
         """
-        Pasada global:
-          - Detecta duplicados entre ficheros y agrega el hallazgo a cada file implicado.
-          - Emite exactamente un artifact por fichero con todos los hallazgos combinados.
-        """
+        Global pass:
+        - Detects duplicates between files and adds the finding to each affected file.
+        - Returns exactly one artifact per file with all findings combined."""
         try:
             dup = core.msgid_find_duplicates() or {}
             for mid, recs in dup.items():
                 summ = core.msgid_summarize(mid, recs)
-                text = u"[Duplicado] Message-ID: {mid}\n" \
-                       u"Ocurrencias: {cnt}\n" \
-                       u"Archivos: {files}\n" \
+                text = u"[Duplicate] Message-ID: {mid}\n" \
+                       u"Ocurrencies: {cnt}\n" \
+                       u"Files: {files}\n" \
                        u"Froms: {froms}\n" \
-                       u"Etiquetas: {labels}".format(
+                       u"Tags: {labels}".format(
                            mid=summ['msgid'],
                            cnt=summ['count'],
                            files=u", ".join(summ['files']),
@@ -240,8 +240,8 @@ class TFMMessageIDModule(FileIngestModule):
                     if f:
                         self._merge_hit(f, text, int(summ['score']))
         except Exception:
-            # No frenar el cierre del módulo por errores de agregado global
+            # Do not stop the module from closing due to global aggregation errors
             pass
 
-        # Finalmente, publicamos un único artifact por cada fichero
+        # Finally, we publish a single artifact per file.
         self._emit_all()

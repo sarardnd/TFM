@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# tfm_email_headers_module.py
+# headers_simple_module.py
 
 import jarray, email
 from org.sleuthkit.autopsy.ingest import IngestModule, FileIngestModule, IngestModuleFactoryAdapter
@@ -20,7 +20,7 @@ MODULE_VER  = u"1.0"
 class TFMEmailHeadersFactory(IngestModuleFactoryAdapter):
     moduleName = MODULE_NAME
     def getModuleDisplayName(self): return self.moduleName
-    def getModuleDescription(self): return u"From, To, Subject, Message-ID, Path y timestamps."
+    def getModuleDescription(self): return u"From, To, Subject, Message-ID and Date."
     def getModuleVersionNumber(self): return MODULE_VER
     def isFileIngestModuleFactory(self): return True
     def createFileIngestModule(self, settings): return TFMEmailHeadersModule()
@@ -54,9 +54,9 @@ class TFMEmailHeadersModule(FileIngestModule):
             BlackboardAttribute(BlackboardAttribute.ATTRIBUTE_TYPE.TSK_PATH,          MODULE_NAME, f.getUniquePath()),
             BlackboardAttribute(BlackboardAttribute.ATTRIBUTE_TYPE.TSK_DATETIME_SENT, MODULE_NAME, ts_sent),
         ]
-        # Algunas versiones no tienen RCVD:
+        
         try:
-            attrs.append(BlackboardAttribute(BlackboardAttribute.ATTRIBUTE_TYPE.TSK_DATETIME_RCVD, MODULE_NAME, ts_rcvd))
+            attrs.append(BlackboardAttribute(BlackboardAttribute.ATTRIBUTE_TYPE.TSK_DATETIME_RCVD, MODULE_NAME, ts_rcvd)) # some mails do not have rcvd:
         except:
             pass
         art.addAttributes(attrs)

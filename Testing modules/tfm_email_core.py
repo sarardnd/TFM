@@ -9,7 +9,7 @@ import math
 import sys, os
 
 def u_(x):
-    """Asegura unicode (Jython)."""
+    """Ensure unicode (Jython)."""
     try:
         if isinstance(x, unicode): return x
         return unicode(x, "utf-8", "ignore")
@@ -17,7 +17,7 @@ def u_(x):
         return unicode(str(x), "utf-8", "ignore")
 
 def decode_mime_header(val):
-    """Decodifica cabeceras MIME (Subject, From, etc.)."""
+    """Decode MIME headers(Subject, From...)"""
     if not val: return u""
     parts = []
     for b, c in decode_header(val):
@@ -38,7 +38,7 @@ def decode_mime_header(val):
 # --- Helpers de destinatarios ---
 def _decode_addrlist(pairs):
     """
-    Decodifica [(name, addr)] -> lista de strings legibles "Nombre <addr>" o "addr".
+    Decode [(name, addr)] -> string list "Nombre <addr>" or "addr".
     """
     out = []
     for nm, addr in pairs:
@@ -54,16 +54,16 @@ def _decode_addrlist(pairs):
 
 def best_recipient(msg):
     """
-    Devuelve un string con los destinatarios 'mejores' para mostrar:
-    - Prioriza To, luego Resent-To, Delivered-To, X-Original-To, Envelope-To.
-    - Soporta múltiples cabeceras y múltiples direcciones por cabecera.
-    - Deduplica manteniendo el orden.
+    Returns a string with the 'best' recipients to display:
+    - To, Forward To, Delivered To, X-Original-To, Envelope-To.
+    - Supports multiple headers and multiple addresses per header.
+    - Deduplicates while maintaining order.
     """
     try:
-        # Py2/Jython: getaddresses está en email.Utils
+        # Py2/Jython: getaddresses is in email.Utils
         import email.Utils as EUtils
     except:
-        import email.utils as EUtils  # fallback por si acaso
+        import email.utils as EUtils  # fallback
 
     candidate_headers = [
         'To', 'Resent-To', 'Delivered-To', 'X-Original-To', 'Envelope-To'
@@ -76,13 +76,13 @@ def best_recipient(msg):
         raw_vals = msg.get_all(h)
         if not raw_vals:
             continue
-        # Puede haber múltiples cabeceras y múltiples direcciones por cabecera
+        # There can be multiple headers and multiple addresses per header
         addrs = []
         for raw in raw_vals:
             try:
                 addrs.extend(EUtils.getaddresses([u_(raw)]))
             except:
-                # Si falla el parseo, al menos añade la cadena cruda
+                # at least add the raw string
                 addrs.append((u"", u_(raw)))
 
         decoded = _decode_addrlist(addrs)
@@ -95,7 +95,7 @@ def best_recipient(msg):
     return u", ".join(ordered)
 
 def date_to_epoch(date_str):
-    """Convierte 'Date:' a epoch (segundos)."""
+    """Convert 'Date:' to epoch (secs)."""
     try:
         import email.Utils as EU
         tup = EU.parsedate_tz(u_(date_str))
@@ -105,7 +105,7 @@ def date_to_epoch(date_str):
     return long(0)
 
 def received_to_epoch(msg):
-    """Devuelve el epoch del primer 'Received:' (fecha tras el último ';')."""
+    """Returns the epoch of the first 'Received:' (date after the last ';')"""
     rec_list = msg.get_all('Received') or []
     for r in rec_list:
         try:
@@ -118,12 +118,12 @@ def received_to_epoch(msg):
     return long(0)
 
 def sha256_bytes(b): 
-    """SHA-256 hex de bytes."""
+    """SHA-256 bytes."""
     return hashlib.sha256(b).hexdigest()
 
 # ---------- utilidades de host / dominios ----------
 def _norm_host(h):
-    """Normaliza host (lower, sin corchetes/paréntesis)."""
+    """Normalize host (lower, without brackets/parentheses)."""
     if not h: return None
     h = h.strip().lower()
     if h.startswith('[') and h.endswith(']'):
@@ -132,7 +132,7 @@ def _norm_host(h):
     return h or None
 
 def _org_domain(h):
-    """Dominio organizativo simple (dos labels finales)."""
+    """Simple organizational domain (two final labels)."""
     if not h: return None
     parts = h.split('.')
     if len(parts) >= 2:
@@ -140,7 +140,7 @@ def _org_domain(h):
     return h
 
 def _cluster_domain(h):
-    """3-4 labels finales para agrupar clusters (útil M365)."""
+    """3-4 final labels for grouping clusters (useful M365)."""
     if not h: return None
     parts = h.split('.')
     if len(parts) >= 4:
@@ -158,8 +158,8 @@ def _same_cluster(a, b):
 def _same_org(a, b):
     return _org_domain(_norm_host(a)) == _org_domain(_norm_host(b))
 
-# ---------- utilidades IP (IPv4 privadas, IPv6 privadas) ----------
-# CIDRs privados/reservados IPv4
+# ---------- IP utilities (IPv4 private, IPv6 private) ----------
+# CIDRs private/reserved IPv4
 _PRIVATE_V4 = [
     ("10.0.0.0", 8),
     ("172.16.0.0", 12),
@@ -188,30 +188,30 @@ def is_private_v4(ip):
             return True
     return False
 
-# Extractores principales: IPs en corchetes
+# Main extractors: IPs in brackets
 _IPV4_BRACKET_RE = re.compile(r'\[(?P<ip>(?:\d{1,3}\.){3}\d{1,3})\]')
 _IPV6_BRACKET_RE = re.compile(r'\[(?:IPv6:)?(?P<ip>[0-9A-Fa-f:]{2,})\]')
 
-# Fallback seguro: IPs en paréntesis, pero SOLO justo tras 'from'/'by'
+# Safe fallback: IPs in parentheses, but ONLY right after 'from'/'by'
 _FROM_PAREN = re.compile(r'\bfrom\s+[^\s;()]+\s*\((?P<paren>[^)]*)\)', re.IGNORECASE)
 _BY_PAREN   = re.compile(r'\bby\s+[^\s;()]+\s*\((?P<paren>[^)]*)\)',   re.IGNORECASE)
 _IPV4_BARE  = re.compile(r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b')
 _IPV6_BARE  = re.compile(r'\b[0-9A-Fa-f:]{2,}\b')
 
 def _ips_in_paren_blob(blob):
-    """Busca IPv4/IPv6 en el contenido de paréntesis de from/by."""
+    """Search for IPv4/IPv6 in the parenthetical content of from/by."""
     v4 = _IPV4_BARE.findall(blob or '')
     v6 = [s for s in _IPV6_BARE.findall(blob or '') if ':' in s and any(c in s.lower() for c in 'abcdef:')]
     return v4, v6
 
 def extract_ips_from_received(raw):
-    """Extrae IPs priorizando [corchetes]; si no hay, fallback a (paréntesis) de from/by."""
-    # 1) Fuerte: corchetes
+    """Extract IPs prioritizing [brackets]; if none, fallback to (parentheses) of from/by."""
+    # 1) Brackets
     v4 = [m.group('ip') for m in _IPV4_BRACKET_RE.finditer(raw)]
     v6 = [m.group('ip') for m in _IPV6_BRACKET_RE.finditer(raw)
           if ':' in m.group('ip') and any(c in m.group('ip').lower() for c in 'abcdef:')]
 
-    # 2) Fallback: paréntesis SOLO tras from/by
+    # 2) Fallback: parentheses only after from/by
     if not v4 and not v6:
         mfrom = _FROM_PAREN.search(raw)
         if mfrom:
@@ -222,7 +222,7 @@ def extract_ips_from_received(raw):
             a4, a6 = _ips_in_paren_blob(mby.group('paren'))
             v4 += a4; v6 += a6
 
-    # deduplicar manteniendo orden
+    # deduplicate taking into acount the order
     def _dedup(seq):
         seen = set(); out = []
         for x in seq:
@@ -233,7 +233,7 @@ def extract_ips_from_received(raw):
     return _dedup(v4), _dedup(v6)
 
 def looks_private_v6_addr(ip):
-    """IPv6 privada: ::1, fe80::/10 (link-local), fc00::/7 (ULA)."""
+    """IPv6 private: ::1, fe80::/10 (link-local), fc00::/7 (ULA)."""
     low = ip.lower()
     if low == '::1':
         return True
@@ -245,8 +245,8 @@ def looks_private_v6_addr(ip):
         return True
     return False
 
-# ---------- parseo & análisis de Received ----------
-# from ... by ... (permitir saltos de línea y rarezas)
+# ---------- parse & analysis of Received ----------
+# from ... by ... (allow line breaks and oddities)
 _FROM_BY_RE = re.compile(
     r'\bfrom\s+([^\s;()]+).*?\bby\s+([^\s;()]+)',
     re.IGNORECASE | re.DOTALL
@@ -255,7 +255,7 @@ _FROM_BY_RE = re.compile(
 _BY_ONLY_RE = re.compile(r'\bby\s+([^\s;()]+)', re.IGNORECASE)
 
 def _parse_received_timestamp(raw):
-    """Extrae la fecha tras el último ';' y la convierte a epoch UTC."""
+    """Extract the date after the last ';' and convert it to epoch UTC."""
     parts = raw.rsplit(';', 1)
     if len(parts) < 2:
         return (None, None)
@@ -270,11 +270,11 @@ def _parse_received_timestamp(raw):
         return (None, None)
 
 def normalize_header_spacing(raw):
-    """Une líneas dobladas y colapsa espacios."""
+    """Join folded lines and collapse spaces."""
     return ' '.join(raw.split())
 
 def parse_received_chain(msg):
-    """Devuelve lista de hops con campos clave para análisis."""
+    """Returns a list of hops with key fields for analysis."""
     hops = []
     recvs = msg.get_all('Received') or []
     for i, raw in enumerate(recvs):
@@ -310,12 +310,12 @@ def parse_received_chain(msg):
 
 def analyze_received_chain(hops):
     """
-    Hallazgos:
-      - reverse_order: pares (i-1, i) cuando epoch[i] > epoch[i-1]
-      - no_date: indices sin fecha parseable
-      - priv_ip: indices con IP privada/loopback
-      - link_breaks: indices donde falla la continuidad BY[i+1] == FROM[i]
-                     (relajada por cluster/organización)
+    Findings:
+    - reverse_order: (i-1, i) pairs where epoch[i] > epoch[i-1] 
+    - no_date: indices without a parseable date
+    - priv_ip: indices with private IPs/loopbacks
+    - link_breaks: indices where continuity fails under BY[i+1] == FROM[i]
+                            (relaxed by cluster/organization)
     """
     issues = {
         'reverse_order': [],
@@ -323,21 +323,21 @@ def analyze_received_chain(hops):
         'priv_ip': [],
         'link_breaks': [],
     }
-    # Fechas faltantes + IPs privadas
+    # Missing dates + private IPs
     for h in hops:
         if h['epoch'] is None:
             issues['no_date'].append(h['idx'])
         if h['has_priv']:
             issues['priv_ip'].append(h['idx'])
 
-    # Orden cronológico (de 0→n deben ser no crecientes)
+    # Chronological order (from 0→n they must be non-increasing)
     for i in range(1, len(hops)):
         prev, cur = hops[i-1], hops[i]
         if prev['epoch'] is not None and cur['epoch'] is not None:
             if cur['epoch'] > prev['epoch']:
                 issues['reverse_order'].append((i-1, i))
 
-    # Continuidad BY[i+1] == FROM[i] (relajada por cluster/organización)
+    # Continuity BY[i+1] == FROM[i] (relaxed by cluster/organization)
     for i in range(0, len(hops)-1):
         frm_i = hops[i]['from']
         by_next = hops[i+1]['by']
@@ -349,23 +349,23 @@ def analyze_received_chain(hops):
             continue
         if _same_org(by_next, frm_i):
             continue
-        issues['link_breaks'].append(i+1)  # ruptura observada en el hop siguiente
+        issues['link_breaks'].append(i+1)  # break observed on the next hop
 
     return issues
 
 def summarize_received_findings(hops, issues):
-    """Construye el texto para Analysis Results + puntuación."""
+    """Build the text for Analysis Results + punctuation."""
     parts = []
     n = len(hops)
-    parts.append("Cadena Received: {} hops".format(n))
+    parts.append("Received Chain: {} hops".format(n))
 
     if issues['reverse_order']:
         pairs = ["{}→{}".format(a,b) for (a,b) in issues['reverse_order']]
-        parts.append("\n- Orden cronológico inverso en pares de hops: " + ", ".join(pairs))
+        parts.append("\n- Reverse chronological order in pairs of hops: " + ", ".join(pairs))
     if issues['no_date']:
-        parts.append("\n- Hops sin fecha parseable: " + ", ".join(str(i) for i in issues['no_date']))
+        parts.append("\n- Hops without a parsable date: " + ", ".join(str(i) for i in issues['no_date']))
 
-    # Desglosar IP privada en ALERTA vs INFO (local/org)
+    # Break down private IP in ALERT vs INFO (local/org)
     priv_info = []
     priv_alert = []
     for i in issues['priv_ip']:
@@ -378,16 +378,16 @@ def summarize_received_findings(hops, issues):
             priv_alert.append(text)
 
     if priv_alert:
-        parts.append("\n- IP privada/loopback potencialmente expuesta en hops: " + ", ".join(priv_alert))
+        parts.append("\n- Private IP/loopback potentially exposed in hops: " + ", ".join(priv_alert))
     if priv_info:
-        parts.append("\n- INFO: IP privada/loopback en hop local/organización: " + ", ".join(priv_info))
+        parts.append("\n- INFO: Private IP/loopback in local hop/organization: " + ", ".join(priv_info))
 
     if issues['link_breaks']:
-        parts.append("\n- Posibles hops faltantes (continuidad BY[i+1]≠FROM[i]) en: " +
+        parts.append("\n- Possible missing hops (continuity BY[i+1]≠FROM[i]) in: " +
                      ", ".join(str(i) for i in issues['link_breaks']))
 
-    # Detalle compacto por hop
-    parts.append("— Detalle por hop —")
+    #Compact detail per hop
+    parts.append("— Detail per hop —")
     for h in hops:
         v4 = ", ".join(h['ipv4']) if h['ipv4'] else "-"
         v6 = ", ".join(h['ipv6']) if h['ipv6'] else "-"
@@ -401,14 +401,14 @@ def summarize_received_findings(hops, issues):
         ))
 
     if len(parts) == 2:
-        parts.insert(1, "\n- Sin anomalías evidentes en Received.")
+        parts.insert(1, "\n- No apparent anomalies in Received.")
 
-    # Puntuación: severidad simple
+    #Score: simple severity
     score = 0
     score += 20 * len(issues['reverse_order'])
     score += 10 * len(issues['no_date'])
 
-    # Penalización ajustada por IP privada (leve si hop local/org)
+    # Penalty adjusted for private IP (mild if hop local/org)
     priv_penalty = 0
     for i in issues['priv_ip']:
         h = hops[i]

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# tfm_email_hashes_module.py
+# hash_files_module.py
 
 import jarray, email
 from org.sleuthkit.autopsy.ingest import IngestModule, FileIngestModule, IngestModuleFactoryAdapter, IngestMessage, IngestServices
@@ -20,7 +20,7 @@ MODULE_VER  = u"1.0"
 class TFMEmailHashesFactory(IngestModuleFactoryAdapter):
     moduleName = MODULE_NAME
     def getModuleDisplayName(self): return self.moduleName
-    def getModuleDescription(self): return u"SHA-256 del .eml y de cada adjunto."
+    def getModuleDescription(self): return u"email and attachments SHA-256."
     def getModuleVersionNumber(self): return MODULE_VER
     def isFileIngestModuleFactory(self): return True
     def createFileIngestModule(self, settings): return TFMEmailHashesModule()
@@ -37,11 +37,11 @@ class TFMEmailHashesModule(FileIngestModule):
             content = buf.tostring()
             if not content: return IngestModule.ProcessResult.OK
 
-            # Hash de email
+            # Hash email
             h_mail = core.sha256_bytes(content)
             self._hit(f, u"Email Hashes", u"Email SHA-256", h_mail)
 
-            # Hash de adjuntos
+            # Hash attachments
             msg = email.message_from_string(content)
             cnt = 0
             for part in msg.walk():
