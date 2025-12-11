@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-# tfm_email_dkim_module.py
+# dkim_check_module.py
 from __future__ import unicode_literals
 
 import jarray, email
 from org.sleuthkit.autopsy.ingest import IngestModule, FileIngestModule, IngestModuleFactoryAdapter, IngestMessage, IngestServices
 from org.sleuthkit.autopsy.casemodule import Case
 from org.sleuthkit.datamodel import BlackboardArtifact, BlackboardAttribute, ReadContentInputStream
-from java.io import ByteArrayOutputStream  # <-- AÑADIDO
+from java.io import ByteArrayOutputStream 
 
 import sys, os
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -17,20 +17,18 @@ if CORE_PATH not in sys.path:
 import tfm_email_core as core
 
 MODULE_NAME = u"TFM Email DKIM Inspector"
-MODULE_VER  = u"1.1"  # <-- sube versión para identificar cambios
+MODULE_VER  = u"1.0"  
 
 class TFMEmailDKIMFactory(IngestModuleFactoryAdapter):
     moduleName = MODULE_NAME
     def getModuleDisplayName(self): return self.moduleName
-    def getModuleDescription(self): return u"Analiza y verifica firmas DKIM en correos electrónicos (.eml)."
+    def getModuleDescription(self): return u"Analize and verify DKIM signatures in emails."
     def getModuleVersionNumber(self): return MODULE_VER
     def isFileIngestModuleFactory(self): return True
     def createFileIngestModule(self, settings): return TFMEmailDKIMModule()
 
 class TFMEmailDKIMModule(FileIngestModule):
-
     def _read_raw_bytes(self, f):
-        """Lee el EML en bytes crudos, sin recodificar ni tocar EOL."""
         istream = ReadContentInputStream(f)
         baos = ByteArrayOutputStream()
         buf = jarray.zeros(8192, 'b')
@@ -39,14 +37,14 @@ class TFMEmailDKIMModule(FileIngestModule):
             if n < 0:
                 break
             baos.write(buf, 0, n)
-        return baos.toByteArray()  # Java byte[]
+        return baos.toByteArray() 
 
     def process(self, f):
         name = f.getName()
         if (not f.isFile()) or (not name or not name.lower().endswith(".eml")):
             return IngestModule.ProcessResult.OK
         try:
-            # --- BYTES CRUDOS ---
+            # --- RAW BYTES ---
             raw_bytes = self._read_raw_bytes(f)
 
             # Parse SOLO para UI/textos (NO usar para verificar DKIM)

@@ -101,7 +101,7 @@ def parse_authentication_results(msg):
     return out
 
 def _pick_spf_context_from_ar(ar_list):
-    """Extrae client-ip, helo y mailfrom de AR (primer bloque útil)."""
+    """Extract client-ip, helo, and mailfrom from AR (first useful block)."""
     client_ip = helo = mailfrom = None
     for ar in ar_list:
         kv = ar.get('kv') or {}
@@ -118,7 +118,7 @@ def _pick_spf_context_from_ar(ar_list):
             break
     return client_ip, helo, mailfrom
 
-# -------------------- ARC pasivo --------------------
+# -------------------- ARC passive --------------------
 def parse_arc_chain(msg):
     seals = msg.get_all('ARC-Seal') or []
     ams   = msg.get_all('ARC-Message-Signature') or []
@@ -176,12 +176,12 @@ def parse_arc_chain(msg):
 # -------------------- ARC criptográfico (dkimpy) --------------------
 def arc_crypto_verify(raw_bytes):
     """
-    Verificación ARC robusta para diferentes builds de dkimpy.
-    Orden:
+    Robust ARC verification for different dkimpy builds.
+    Order:
       1) dkim.arcverify.verify(msg)
       2) dkim.arcverify.ArcVerifier/ARCVerifier(...).verify()/validate()
-      3) Fallback CLI:  python -m dkim.arcverify  (lee msg por stdin)
-    Devuelve: {supported, ok, result, details, impl}
+      3) Fallback CLI: python -m dkim.arcverify (read msg by stdin)
+    Returns: {supported, ok, result, details, impl}
     """
     import sys as _sys
     import importlib
@@ -190,7 +190,7 @@ def arc_crypto_verify(raw_bytes):
     except Exception as e:
         return {"supported": False, "ok": False, "result": "missing_dkimpy", "details": str(e), "impl": None}
 
-    # ---- helper para normalizar resultado ----
+    # ---- helper ----
     def _pack(result, details, impl):
         r = (str(result).lower() if result is not None else "unknown")
         ok = r in ("pass", "ok", "valid", "true", "success")
@@ -211,17 +211,17 @@ def arc_crypto_verify(raw_bytes):
     except Exception as e:
         last_err = "import dkim.arcverify failed: {}".format(e)
 
-    # 2) ArcVerifier / ARCVerifier con verify()/validate()
+    # 2) ArcVerifier / ARCVerifier with verify()/validate()
     try:
         arcverify = importlib.import_module("dkim.arcverify")
         for cname in ("ArcVerifier", "ARCVerifier"):
             if hasattr(arcverify, cname):
                 Cls = getattr(arcverify, cname)
                 try:
-                    v = Cls(raw_bytes)  # algunas versiones aceptan msg en el ctor
+                    v = Cls(raw_bytes)  # Some versions accept messages in the inductor
                 except TypeError:
                     try:
-                        v = Cls()       # o sin argumentos
+                        v = Cls()       
                         if hasattr(v, "set_message"):
                             v.set_message(raw_bytes)
                     except Exception as e2:
@@ -241,20 +241,20 @@ def arc_crypto_verify(raw_bytes):
     except Exception as e:
         last_err = "arcverify class route failed: {}".format(e)
 
-    # 5) Fallback CLI: python -m dkim.arcverify  (lee stdin, parsea salida)
+    # 5) Fallback CLI: python -m dkim.arcverify  (read stdin, parse salida)
     try:
         import subprocess, shlex
         cmd = [_sys.executable, "-m", "dkim.arcverify"]
         p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         out, err = p.communicate(raw_bytes, timeout=15)
         text = (out or b"").decode("utf-8", "ignore").strip().lower()
-        # dkimpy suele imprimir 'pass' / 'fail' / 'neutral' o mensajes más largos
+        # dkimpy usually prints 'pass' / 'fail' / 'neutral' or longer messages
         if "pass" in text:
             return _pack("pass", out.decode("utf-8","ignore"), "cli:python -m dkim.arcverify")
         if "fail" in text:
             return _pack("fail", out.decode("utf-8","ignore"), "cli:python -m dkim.arcverify")
         if p.returncode == 0 and text:
-            # no incluye 'pass'/'fail' explícito; damos salida textual
+            # It does not include explicit 'pass'/'fail'; we provide textual output
             return {"supported": True, "ok": False, "result": "unknown", "details": text, "impl": "cli:python -m dkim.arcverify"}
         last_err = "cli exit rc={} out={} err={}".format(p.returncode, text, (err or b"").decode("utf-8","ignore"))
     except Exception as e:
@@ -265,9 +265,8 @@ def arc_crypto_verify(raw_bytes):
 # -------------------- SPF recalc (pyspf) --------------------
 def spf_recalc(client_ip, helo, mailfrom, from_domain):
     """
-    Recalcula SPF con pyspf: check2(i=IP, s=sender, h=helo)
-    Devuelve diccionario con resultado y alineación organizativa con From.
-    """
+    Recalculate SPF with pyspf: check2(i=IP, s=sender, h=helo)
+    Return a dictionary with the result and organizational alignment using From."""
     try:
         import spf  # pyspf
     except Exception as e:
@@ -334,11 +333,11 @@ def main():
     # AR
     ar_list = parse_authentication_results(msg)
 
-    # SPF recalc (pyspf) a partir de AR
+    # SPF recalc (pyspf) from AR
     client_ip, helo, mailfrom = _pick_spf_context_from_ar(ar_list)
     spf_recalc_block = spf_recalc(client_ip, helo, mailfrom, from_dom)
 
-    # SPF DNS (publicados)
+    # SPF DNS (published)
     spf_targets = []
     if from_dom:
         spf_targets.append(from_dom)
@@ -369,7 +368,7 @@ def main():
                         parsed[k.strip().lower()] = v.strip()
             dmarc_dns = {"found": bool(recs), "records": recs, "parsed": parsed, "source": from_dom}
         else:
-            # si el subdominio no existe, intentamos el dominio organizativo
+            # If the subdomain does not exist, we try the organizational domain.
             org = org_domain_simple(from_dom)
             if org and org != from_dom:
                 org_target = "_dmarc." + org
@@ -387,7 +386,7 @@ def main():
                         "found": bool(recs2),
                         "records": recs2,
                         "parsed": parsed2,
-                        "source": org + " (heredado)"
+                        "source": org + " (inherited)"
                     }
                 else:
                     dmarc_dns = {"error": u(val2)}

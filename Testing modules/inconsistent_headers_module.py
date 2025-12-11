@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# tfm_email_received_module.py
+# inconsistent_headers_module.py 
 
 import jarray, email
 from org.sleuthkit.autopsy.ingest import IngestModule, FileIngestModule, IngestModuleFactoryAdapter, IngestMessage, IngestServices
@@ -20,7 +20,7 @@ MODULE_VER  = u"1.0"
 class TFMEmailReceivedFactory(IngestModuleFactoryAdapter):
     moduleName = MODULE_NAME
     def getModuleDisplayName(self): return self.moduleName
-    def getModuleDescription(self): return u"Analiza Received: orden, continuidad y IPs privadas."
+    def getModuleDescription(self): return u"Analyze Received: order, continuity, and private IPs."
     def getModuleVersionNumber(self): return MODULE_VER
     def isFileIngestModuleFactory(self): return True
     def createFileIngestModule(self, settings): return TFMEmailReceivedModule()
@@ -41,7 +41,7 @@ class TFMEmailReceivedModule(FileIngestModule):
             issues = core.analyze_received_chain(hops)
             summary, score = core.summarize_received_findings(hops, issues)
 
-            self._hit(f, u"Received  headers", summary, score)
+            self._hit(f, u"Received headers", summary, score)
             return IngestModule.ProcessResult.OK
         except Exception as e:
             IngestServices.getInstance().postMessage(

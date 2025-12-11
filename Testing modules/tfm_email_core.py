@@ -425,9 +425,9 @@ def summarize_received_findings(hops, issues):
 # =============== DATE COHERENCE (helpers) ===============
 def get_date_header_epoch(msg):
     """
-    Extrae y convierte la cabecera 'Date:' a epoch UTC.
-    Detecta y reporta múltiples cabeceras Date:
-    Devuelve (epoch, date_str, is_multiple_date_header)
+    Extracts and converts the 'Date:' header to a UTC epoch.
+    Detects and reports multiple Date: headers.
+    Returns (epoch, date_str, is_multiple_date_header)
     """
     date_list = msg.get_all('Date') or []
     
@@ -436,7 +436,7 @@ def get_date_header_epoch(msg):
     if not date_list:
         return None, None, False
         
-    # Usamos la primera Date: si hay múltiples, pero marcamos la anomalía
+    # We use the first Date: if there are multiple, but we mark the anomaly
     date_str = date_list[0] 
     
     if date_str:
@@ -447,8 +447,8 @@ def get_date_header_epoch(msg):
 
 def get_all_time_headers(msg):
     """
-    Recopila épocas de cabeceras de tiempo alternativas.
-    Útiles como contexto, pero no para comprobaciones de coherencia fuertes.
+    It compiles alternative time periods.
+    Useful for context, but not for rigorous consistency checks.    
     """
     ALT_HEADERS = ['X-Received', 'Delivery-date', 'Resent-Date', 'X-Original-ArrivalTime']
     alt_dates = {}
@@ -457,13 +457,13 @@ def get_all_time_headers(msg):
         h_values = msg.get_all(h_name) or []
         for val in h_values:
             val = u_(val)
-            # X-Original-ArrivalTime es especial: "DD Mon YY HH:MM:SS.mmm (UTC) [IP]"
+            # X-Original-ArrivalTime: "DD Mon YY HH:MM:SS.mmm (UTC) [IP]"
             if h_name == 'X-Original-ArrivalTime':
-                # Intentamos extraer el timestamp del formato de Exchange
+                # Try to extract the timestamp from the Exchange format
                 m = re.match(r'\s*(.+?)\s+\(UTC\)', val)
                 date_part = m.group(1) if m else val
             else:
-                # Para otras, el valor completo es la fecha
+                # DAte value
                 date_part = val
                 
             epoch = date_to_epoch(date_part)
@@ -476,24 +476,21 @@ def get_all_time_headers(msg):
 
 def analyze_date_coherence(date_epoch, date_str, is_multiple_date, hops, f_date, ingest_time):
     """
-    Analiza la coherencia entre Date: (declarada), Received (último hop), 
-    metadatos de archivo (f_date), y la hora de ingesta (ingest_time).
-    
-    date_epoch: epoch de la cabecera Date:
-    is_multiple_date: True si se encontraron múltiples cabeceras Date:
-    hops: lista de hops de Received (del parser original)
-    f_date: epoch de la última modificación/creación del archivo EML
-    ingest_time: epoch del momento en que Autopsy está procesando
-    
-    Devuelve un diccionario de hallazgos.
+    Analyzes the consistency between Date: (declared), Received (last hop), file metadata (f_date), and ingestion time (ingest_time).
+    date_epoch: epoch of the Date: header
+    is_multiple_date: True if multiple Date: headers were found
+    hops: list of hops from Received (from the original parser)
+    f_date: epoch of the last modification/creation of the EML file
+    ingest_time: epoch of when Autopsy is processing
+    Returns a dictionary of findings.
     """
     issues = {
         'no_date_header': False, 
-        'multiple_date_header': is_multiple_date, # Nuevo: Más de una Date:
+        'multiple_date_header': is_multiple_date, 
         'date_after_last_recv': None, 
         'file_before_date': None, 
         'file_after_last_recv': None,
-        'date_in_future': None, # Nuevo: Date: en el futuro (respecto a ingest_time)
+        'date_in_future': None, 
         'last_recv_epoch': None,
         'last_recv_idx': None
     }
@@ -502,12 +499,12 @@ def analyze_date_coherence(date_epoch, date_str, is_multiple_date, hops, f_date,
         issues['no_date_header'] = True
         return issues
         
-    # 1. Obtener la fecha del primer hop Received (el último en el tiempo)
+    # 1. Obtain the date of the first hop Received (the last one in time)
     last_recv_epoch = None
     last_recv_idx = None
     for h in hops:
         if h['epoch'] is not None:
-            # Encontramos la Received: con el timestamp más grande (más reciente)
+            # Find the Received: with the largest (most recent) timestamp
             if last_recv_epoch is None or h['epoch'] > last_recv_epoch:
                 last_recv_epoch = h['epoch']
                 last_recv_idx = h['idx']
@@ -515,106 +512,105 @@ def analyze_date_coherence(date_epoch, date_str, is_multiple_date, hops, f_date,
     issues['last_recv_epoch'] = last_recv_epoch
     issues['last_recv_idx'] = last_recv_idx
 
-    # 2. Date: posterior al último Received
-    # Un desfase mayor a 5 minutos (300s) es sospechoso
+    # 2. Date: after the last Received
+    # A delay greater than 5 minutes (300s) is suspicious
     if last_recv_epoch is not None:
         diff = date_epoch - last_recv_epoch
         if diff > 300: 
             issues['date_after_last_recv'] = diff
 
-    # 3. Date: en el futuro (respecto al reloj de ingesta)
-    # Si Date: es más de 24h (86400s) en el futuro, es ALERTA fuerte
+    # 3. Date: in the future (relative to the ingestion clock)
+    # If Date: is more than 24 hours (86400s) in the future, it is a strong ALERT
     if ingest_time is not None:
         diff_future = date_epoch - ingest_time
         if diff_future > 86400: 
             issues['date_in_future'] = diff_future
     
-    # 4. Metadato de archivo EML (f_date) vs Date:
+    # 4. EML file metadata (f_date) vs Date:
     if f_date is not None and f_date > 0:
         diff = date_epoch - f_date
-        # Si f_date es más de 7 días (604800s) anterior a Date:
+        # If f_date is more than 7 days (604800s) prior to Date:
         if diff > 604800: 
             issues['file_before_date'] = diff 
         
-        # 5. Metadato de archivo EML (f_date) vs Último Received
+        # 5. EML file metadata (f_date) vs Last Received
         if last_recv_epoch is not None:
             diff_recv = f_date - last_recv_epoch
-            # Si f_date es más de 7 días (604800s) posterior al último Received:
+            # If f_date is more than 7 days (604800s) after the last Received:
             if diff_recv > 604800: 
                 issues['file_after_last_recv'] = diff_recv
 
     return issues
 
 def summarize_date_coherence_findings(date_str, f_date, issues, alt_dates):
-    """Construye el texto para Analysis Results + puntuación."""
+    """Build the text for Analysis Results + punctuation."""
     parts = []
     score = 0
     
-    # Valores de entrada
-    parts.append("Fecha Declarada (Date:): {}".format(date_str or "AUSENTE / INVÁLIDA"))
-    parts.append("Último Received (Epoch): {}".format(issues['last_recv_epoch'] or "AUSENTE"))
-    parts.append("Metadato Archivo EML (M/C Time): {}".format(f_date or "AUSENTE"))
+    parts.append("Declared Date (Date:): {}".format(date_str or "MISSING/INVALID"))
+    parts.append("Last Received (Epoch): {}".format(issues['last_recv_epoch'] or "MISSING"))
+    parts.append("Metadata EML File (M/C Time): {}".format(f_date or "MISSING"))
     
-    # Nuevo: Cabeceras alternativas (solo contexto)
+    # Alternative headers
     if alt_dates:
-        parts.append("\n--- Cabeceras de Tiempo Alternativas ---")
+        parts.append("\n--- Alternative Time Headers ---")
         for h_name, dates in alt_dates.items():
             for d in dates:
                 parts.append("• {}: {} (Epoch {})".format(h_name, d['str'], d['epoch']))
     
-    parts.append("\n--- Hallazgos ---")
+    parts.append("\n--- hits ---")
     
     if issues['no_date_header']:
-        parts.append("• ALERTA: Cabecera 'Date:' ausente o formato inválido.")
-        score += 30
+        parts.append("• ALERT: 'Date:' header missing or invalid format.")
+        score += 10
     else:
-        # Nuevo: Múltiples Date:
+        # Multiple Date:
         if issues['multiple_date_header']:
-            parts.append("• ALERTA: Múltiples cabeceras 'Date:' encontradas. Posible manipulación/reencapsulado.")
-            score += 45
+            parts.append("• ALERT: Multiple 'Date:' headers found. Possible manipulation/re-encapsulation.")
+            score += 15
             
-        # Nuevo: Date en el futuro
+        # Future Date
         if issues['date_in_future'] is not None:
             diff_d = float(issues['date_in_future']) / (3600.0 * 24)
-            parts.append("• ¡SEVERA! 'Date:' está en el futuro (>{:.2f} días respecto a la hora de ingesta).".format(diff_d))
-            score += 80 # Subimos la severidad por esta anomalía
+            parts.append("• SEVERE! 'Date:' is in the future (>{:.2f} days with respect to the time of intake).".format(diff_d))
+            score += 25 # Subimos la severidad por esta anomalía
             
-        # Desfase Date: vs Último Received
+        # Delay Date: vs Last Received
         if issues['date_after_last_recv'] is not None:
             diff_h = float(issues['date_after_last_recv']) / 3600.0
-            parts.append("• ALERTA: 'Date:' es posterior al último 'Received' (Hop #{}) por {:.2f} horas.".format(
+            parts.append("• ALERT: 'Date:' is later than the last 'Received' (Hop #{}) for {:.2f} hours.".format(
                 issues['last_recv_idx'], diff_h
             ))
-            score += 50 
+            score += 30 
 
-        # Desfase Metadato Archivo vs Date:
+        # Metadata File vs Date Offset:
         if issues['file_before_date'] is not None:
             diff_d = float(issues['file_before_date']) / (3600.0 * 24)
-            parts.append("• INFO: 'Date:' es mucho posterior a la fecha del archivo EML ({:.2f} días).".format(diff_d))
-            score += 15 
+            parts.append("• INFO: 'Date:' is much later than the date of the EML file ({:.2f} days).".format(diff_d))
+            score += 25 
 
-        # Desfase Metadato Archivo vs Último Received
+        # Metadata File Offset vs Last Received
         if issues['file_after_last_recv'] is not None:
             diff_d = float(issues['file_after_last_recv']) / (3600.0 * 24)
-            parts.append("• ALERTA: Fecha del archivo EML es posterior al último 'Received' ({:.2f} días). Sugiere manipulación del archivo.".format(diff_d))
-            score += 40 
+            parts.append("• ALERT: The EML file date is later than the last 'Received' ({:.2f} days). Please review, it could be due to the download time .".format(diff_d))
+            score += 20 
             
     if score == 0:
-        parts.append("• Sin incongruencias temporales significativas detectadas.")
+        parts.append("• No significant inconsistencies detected.")
 
     return "\n".join(parts), score
 
 # ==== Message-ID utilities (duplicados / formato sospechoso) ====
-# Regex básica que captura algo tipo local@dominio dentro o fuera de '< >'
+# Basic regex that captures something like local@domain inside or outside of '< >'
 _MSGID_RE = re.compile(r'\<?\s*([^>\s]+@[^>\s]+)\s*\>?', re.UNICODE)
 
-# Memoria por ejecución (ingest run):
-#   clave: msgid normalizado
-#   valor: lista de records: {'file_id': long, 'file_name': u'', 'from': u'', 'date': long, 'raw': u''}
+# Memory per execution (ingest run):
+# key: normalized msgid
+# value: list of records: {'file_id': long, 'file_name': u'', 'from': u'', 'date': long, 'raw': u''}
 _MSGID_STORE = {}
 
 def msgid_normalize(raw):
-    """Normaliza el Message-ID (quita < >, trim, lower)."""
+    """Normalize the Message-ID (remove < >, trim, lower)."""
     if not raw:
         return None
     r = u_(raw).strip()
@@ -625,8 +621,8 @@ def msgid_normalize(raw):
 
 def msgid_extract_candidates(header_value):
     """
-    Dado el valor de la cabecera Message-ID (posible múltiple por malformación),
-    devuelve lista de candidatos normalizados.
+    Given the value of the Message-ID header (possibly multiple due to malformation),
+    it returns a list of normalized candidates.
     """
     if not header_value:
         return []
@@ -640,7 +636,7 @@ def msgid_extract_candidates(header_value):
         nm = msgid_normalize(f)
         if nm:
             out.append(nm)
-    # dedup preservando orden
+    # dedup preserving order
     seen = set(); dedup = []
     for x in out:
         if x not in seen:
@@ -648,7 +644,7 @@ def msgid_extract_candidates(header_value):
     return dedup
 
 def msgid_get_local_part(msgid):
-    """Extrae la parte local (antes de @) del Message-ID."""
+    """Extract the local part (before @) of the Message-ID."""
     if not msgid or u'@' not in msgid:
         return None
     # Devuelve solo la primera parte
@@ -656,8 +652,8 @@ def msgid_get_local_part(msgid):
 
 def msgid_token_entropy(s):
     """
-    Entropía de Shannon del string completo.
-    Devuelve: (H_total, H_normalizada) donde H_normalizada = H / Hmax (0..1).
+    Shannon entropy of the entire string.
+    Returns: (H_total, H_normalized) where H_normalized = H / Hmax (0..1).
     """
     if not s: 
         return 0.0, 0.0
@@ -665,15 +661,14 @@ def msgid_token_entropy(s):
     c = Counter(s)
     n = float(len(s))
     H = -sum((cnt/n)*math.log((cnt/n), 2) for cnt in c.values())
-    # Hmax = log2(#símbolos distintos); evita división por 0
     uniq = len(c)
     Hmax = math.log(uniq, 2) if uniq > 1 else 1.0
     return H, (H / Hmax)
 
 def msgid_has_valid_format(msgid):
     """
-    Formato válido mínimo: contiene '@' y la parte de dominio tiene letras/números
-    (admite localhost/hosts raros, pero descarta basura evidente).
+    Minimum valid format: contains '@' and the domain portion has letters/numbers
+    (supports rare localhost/hosts, but discards obvious garbage).
     """
     if not msgid or u'@' not in msgid:
         return False
@@ -685,7 +680,7 @@ def msgid_has_valid_format(msgid):
     return True if re.search(r'[A-Za-z0-9]', domain) else False
 
 def msgid_register(msgid, file_id, file_name, from_header=None, date_epoch=None, raw_msgid=None):
-    """Registra una aparición de msgid (por archivo) en el store global del run."""
+    """Registers one occurrence of msgid (per file) in the global store of the run."""
     nm = msgid_normalize(raw_msgid or msgid)
     if not nm:
         return
@@ -699,18 +694,18 @@ def msgid_register(msgid, file_id, file_name, from_header=None, date_epoch=None,
     _MSGID_STORE.setdefault(nm, []).append(rec)
 
 def msgid_clear_store():
-    """Limpia el índice en memoria."""
+    """Clear the index in memory."""
     _MSGID_STORE.clear()
 
 def msgid_find_duplicates():
-    """Devuelve dict {msgid: [records]} SOLO para los msgids con más de una aparición."""
+    """Returns dict {msgid: [records]} ONLY for msgids with more than one occurrence."""
     return {mid: recs for (mid, recs) in _MSGID_STORE.items() if len(recs) > 1}
 
 def msgid_score_and_labels(msgid, records):
     """
-    Score SOLO para la pasada global (evita duplicidades con el análisis local):
-      +20 si remitentes distintos (posible spoof)
-      +10 si es duplicado (>1)
+    Score ONLY for the global pass (avoids duplicates with local analysis):
+    +20 if different senders (possible spoof)
+    +10 if duplicate (>1)
     """
     score = 0
     labels = []
@@ -727,7 +722,7 @@ def msgid_score_and_labels(msgid, records):
     return score, labels
 
 def msgid_summarize(msgid, records):
-    """Estructura de resumen coherente con otros módulos."""
+    """Summary structure consistent with other modules."""
     score, labels = msgid_score_and_labels(msgid, records)
     return {
         'msgid' : msgid,
@@ -744,10 +739,10 @@ def msgid_summarize(msgid, records):
 
 def extract_x_headers(msg):
     """
-    Devuelve un dict con:
-      - 'all': lista de dicts {'name', 'value'}
-      - 'signals': dict con campos útiles normalizados/heurísticos
-    No lanza excepciones: valores siempre en unicode.
+   Returns a dict with:
+    - 'all': list of dicts {'name', 'value'}
+    - 'signals': dict with normalized/heuristic useful fields
+    - Does not throw exceptions: values are always in Unicode.
     """
     try:
         items = msg.items() or []
@@ -765,59 +760,51 @@ def extract_x_headers(msg):
                     'value': decode_mime_header(v) if v else u""
                 })
         except Exception:
-            # continúa con lo que se pueda
             continue
 
-    # Señales específicas
+    # specfic signals
     def _first_value(prefix):
         for h in x_all:
             if h['name'].lower() == prefix.lower():
                 return h['value']
         return None
 
-    # Conjuntos útiles
+    # significant headers
     x_mailer   = _first_value('X-Mailer')
-    x_exported = _first_value('X-Exported-By')
     x_mimeole  = _first_value('X-MimeOLE')
     x_origip   = _first_value('X-Originating-IP')
 
-    # Familia Exchange/Microsoft (muy frecuente en export/servidor)
+    # Exchange/Microsoft family (very common in export/server)
     ms_family = [h for h in x_all if h['name'].lower().startswith('x-ms-') or
                                    h['name'].lower().startswith('x-forefront-') or
                                    h['name'].lower().startswith('x-microsoft-')]
 
-    # Heurística conservadora de "posible exportación"
-    # Caso fuerte: X-Exported-By presente
-    possible_export = True if x_exported else False
-
-    # Caso débil (solo INFO): cadenas típicas de clientes en X-Mailer
+    # Weak case (INFO only): Typical customer strings in X-Mailer
     weak_client_hint = False
     if x_mailer:
         low = x_mailer.lower()
         weak_client_hint = any(s in low for s in [
-            'outlook', 'thunderbird', 'apple mail', 'gmail', 'iphone mail', 'android mail'
+            'outlook', 'thunderbird', 'apple mail', 'gmail', 'iphone mail', 'android mail', 'yahoo mail'
         ])
 
     return {
         'all': x_all,
         'signals': {
             'x_mailer'        : x_mailer,
-            'x_exported_by'   : x_exported,
             'x_mimeole'       : x_mimeole,
             'x_originating_ip': x_origip,
             'ms_family_count' : len(ms_family),
-            'possible_export' : possible_export,
             'weak_client_hint': weak_client_hint,
         }
     }
 
 def summarize_x_headers_findings(xdata):
     """
-    Construye texto y puntuación para publicar en Analysis Results.
-    Puntuación:
-      +40 si X-Exported-By presente (posible exportación)
-      +10 si hay X-Mailer (solo contexto)
-      +5  si hay familia MS (solo contexto)
+    Create text and punctuation for posting to Analysis Results.
+    Scoring:
+    +10 if X-Exported-By is present (export possible)
+    +10 if X-Mailer is present (context only)
+    +5 if MS family is present (context only)
     """
     parts = []
     score = 0
@@ -825,31 +812,25 @@ def summarize_x_headers_findings(xdata):
     allx = xdata.get('all') or []
     sigs = xdata.get('signals') or {}
 
-    parts.append("Cabeceras X-* encontradas: {}".format(len(allx)))
+    parts.append("X-* headers found: {}".format(len(allx)))
 
-    # Listado compacto (máximo 12 para no saturar)
-    max_list = 12
+    # List (max 8)
+    max_list = 8
     if allx:
-        parts.append("\n— Lista X-* (máx {} mostradas) —".format(max_list))
+        parts.append("\n—X-* list (max {} shown) —".format(max_list))
         for i, h in enumerate(allx[:max_list]):
             parts.append("• {}: {}".format(h.get('name', ''), h.get('value', '')))
         if len(allx) > max_list:
             parts.append("… ({} más)".format(len(allx) - max_list))
     else:
-        parts.append("\n(no hay cabeceras X-*)")
+        parts.append("\n(No X-* headers)")
 
-    parts.append("\n— Señales —")
-    if sigs.get('x_exported_by'):
-        parts.append("• POSIBLE EXPORTACIÓN: X-Exported-By = {}".format(sigs['x_exported_by']))
-        score += 40
-    else:
-        parts.append("• X-Exported-By: ausente")
-
+    parts.append("\n— Other signals —")
     if sigs.get('x_mailer'):
         parts.append("• X-Mailer: {}".format(sigs['x_mailer']))
         score += 10
     else:
-        parts.append("• X-Mailer: ausente")
+        parts.append("• X-Mailer: MISING")
 
     if sigs.get('x_mimeole'):
         parts.append("• X-MimeOLE: {}".format(sigs['x_mimeole']))
@@ -859,23 +840,23 @@ def summarize_x_headers_findings(xdata):
 
     ms_count = int(sigs.get('ms_family_count') or 0)
     if ms_count > 0:
-        parts.append("• Familia Microsoft/Exchange presente ({} cabeceras).".format(ms_count))
+        parts.append("• Microsoft/Exchange family present ({} headers).".format(ms_count))
         score += 5
 
-    # Nota: weak_client_hint es solo informativo, no suma puntos
+    # Note: weak_client_hint is for informational purposes only and does not add points.
     if sigs.get('weak_client_hint'):
-        parts.append("• INFO: X-Mailer parece indicar un cliente reconocido.")
+        parts.append("• INFO: X-Mailer appears to indicate a recognized client.")
 
     if score == 0:
-        parts.append("• Sin señales fuertes de exportación o manipulación derivables solo de X-*.")
+        parts.append("• No strong signs of export or manipulation deriving solely from X-*.")
 
     return "\n".join(parts), int(score)
 
 # ==== DKIM UTILITIES ====
 def parse_dkim_headers(msg):
     """
-    Extrae todas las cabeceras DKIM-Signature.
-    Devuelve una lista de dicts con campos principales.
+    Extracts all DKIM-Signature headers.
+    Returns a list of dicts with primary fields.
     """
     dkims = msg.get_all('DKIM-Signature') or []
     parsed = []
@@ -893,66 +874,66 @@ def parse_dkim_headers(msg):
 
 def verify_dkim_structure(fields):
     """
-    Verifica la presencia mínima de campos DKIM y coherencia básica.
-    No realiza validación criptográfica completa (sin DNS),
-    pero detecta firmas truncadas, hash/body inconsistente, etc.
+    It verifies the minimum presence of DKIM fields and basic consistency.
+    It does not perform full cryptographic validation (no DNS),
+    but it detects truncated signatures, inconsistent hash/body, etc.
     """
     required = ['v', 'a', 'b', 'bh', 'd', 's', 'h','c','i','l','q','t','x']
     missing = [k for k in required if k not in fields]
     issues = []
     if missing:
-        issues.append("Faltan campos: {}".format(', '.join(missing)))
+        issues.append("Missing fields: {}".format(', '.join(missing)))
 
-    # Longitud de firma base64 b= (típicamente >100 chars)
+    # Base64 signature length b= (typically >100 chars)
     if 'b' in fields:
         try:
             siglen = len(fields['b'])
             if siglen < 50:
-                issues.append("Firma (b=) inusualmente corta.")
+                issues.append("Unusually short signature (b=).")
         except:
             pass
 
-    # Hash body (bh=) debería ser base64
+    # Hash body (bh=) should be base64
     if 'bh' in fields:
         bh = fields['bh']
         try:
             base64.b64decode(bh)
         except Exception:
-            issues.append("Campo bh= no es base64 válido.")
+            issues.append("Field bh= is not valid base64.")
 
     return issues
 
 def check_dkim_domain_alignment(dkim_domain, from_header):
-    # Extraer la parte de la dirección y luego el dominio.
+    # Extract the address part and then the domain.
     from_part = from_header.strip().lower()
     
-    # 1. Limpieza de display name y corchetes angulares
+    # 1. Cleaning up display name and angle brackets
     if '<' in from_part and '>' in from_part:
         from_part = from_part.split('<')[-1].split('>')[0]
     
-    # 2. Extracción del dominio tras el '@'
+    # 2. Extracting the domain after the '@'
     if '@' in from_part:
         from_domain = from_part.split('@')[-1]
     else:
-        # Si no hay @, asumimos que from_part ya es el dominio o está malformado
+        # If there is no @ symbol, we assume that from_part is already the domain or is malformed.
         from_domain = from_part
     
     return "ALIGNED" if _same_org(dkim_domain, from_domain) else "MISALIGNED"
 
 def dkim_selector_dns_exists(selector, domain):
     """
-    Comprobación DNS simulada: no realiza query real (Jython sin red),
-    pero valida formato plausible de selector._domainkey.domain.
-    Devuelve True si selector/domino tienen formato correcto.
+    Simulated DNS check: does not perform a real query (Jython without networking),
+    but validates the plausible format of selector._domainkey.domain.
+    Returns True if the selector/domain is in a valid format.
     """
     if not selector or not domain:
         return False
     fqdn = "{}._domainkey.{}".format(selector, domain)
     return bool(re.match(r'^[A-Za-z0-9._-]+\._domainkey\.[A-Za-z0-9.-]+$', fqdn))
 
-# Lista para simular la reputación/expectativa de firma (basada en el dominio organizativo)
+# List to simulate firm reputation/expectation (based on organizational domain)
 _EXPECTED_SIGNERS = {
-    'gmail.com':    True,  # Siempre debería firmar
+    'gmail.com':    True,  # should always sign
     'google.com':   True,
     'microsoft.com': True,
     'outlook.com':  True,
@@ -961,8 +942,8 @@ _EXPECTED_SIGNERS = {
 
 def dkim_expected_to_sign(dkim_domain):
     """
-    Comprueba si el dominio organizativo DKIM está en la lista de firmantes esperados.
-    Si AUSENTE, el score penaliza más. Si PRESENTE y NO FIRMA, penaliza AÚN MÁS.
+    Check if the DKIM organizational domain is on the list of expected signers.
+    If it's MISSING, the score is penalized more. If it's PRESENT but DOESN'T SIGN, the penalty is EVEN MORE.
     """
     if not dkim_domain: return False
     org_dom = _org_domain(_norm_host(dkim_domain))
@@ -970,38 +951,38 @@ def dkim_expected_to_sign(dkim_domain):
 
 def summarize_dkim_findings(parsed, from_header):
     """
-    Construye el resumen textual + puntuación global DKIM.
+    Build the textual summary + DKIM global scoring.
     """
     parts = []
     score = 0
 
     if not parsed:
-        parts.append("Cabecera DKIM-Signature: AUSENTE")
+        parts.append("DKIM-Signature Header: MISSING")
         
         from_part = u_(from_header).strip().lower() 
-        # 1. Limpieza de display name y corchetes angulares
+        # 1. Cleaning up display name and angle brackets
         if u'<' in from_part and u'>' in from_part:
             from_part = from_part.split(u'<')[-1].split(u'>')[0]
         
-        # 2. Extracción del dominio tras el '@'
+        # 2. Extracting the domain after the '@'
         if u'@' in from_part:
             from_domain = from_part.split(u'@')[-1].strip()
         else:
             from_domain = from_part.strip()
 
-        # Chequeo de Reputación
+        # Reputation Check
         if from_domain:
             if dkim_expected_to_sign(from_domain):
-                parts.append("• ¡ALERTA! El dominio organizativo '{}' normalmente firma sus correos (Firma Esperada: AUSENTE).".format(_org_domain(_norm_host(from_domain))))
-                score += 50 # Penalización muy alta
+                parts.append("• ALERT! The organizational domain '{}' normally signs its emails (Expected Signature: MISSING).".format(_org_domain(_norm_host(from_domain))))
+                score += 30 
             else:
-                parts.append("• Contexto: El dominio organizativo '{}' no está marcado como firmante esperado.".format(_org_domain(_norm_host(from_domain))))
+                parts.append("• Context: The organizational domain '{}' is not marked as an expected signatory.".format(_org_domain(_norm_host(from_domain))))
         else:
-            parts.append("• Contexto: No todos los dominios firman sus correos (depende del remitente).")
+            parts.append("• Context: Not all domains sign their emails (it depends on the sender).")
 
         return "\n".join(parts), score
 
-    parts.append("Cabeceras DKIM-Signature encontradas: {}".format(len(parsed)))
+    parts.append("DKIM-Signature headers found: {}".format(len(parsed)))
 
     for i, f in enumerate(parsed):
         d = f.get('d'); s = f.get('s')
@@ -1009,13 +990,13 @@ def summarize_dkim_findings(parsed, from_header):
         align = check_dkim_domain_alignment(d, from_header)
         dns_ok = dkim_selector_dns_exists(s, d)
 
-        parts.append("\n— Firma #{:d} —".format(i+1))
-        parts.append("Dominio (d=): {}".format(d or "N/D"))
+        parts.append("\n— Signature #{:d} —".format(i+1))
+        parts.append("Domain (d=): {}".format(d or "N/D"))
         parts.append("Selector (s=): {}".format(s or "N/D"))
         parts.append("Alineación DKIM↔From: {}".format(align))
-        parts.append("Selector DNS formato válido: {}".format("Sí" if dns_ok else "No"))
+        parts.append("Valid format DNS selector: {}".format("Sí" if dns_ok else "No"))
         if issues:
-            parts.append("Problemas: " + "; ".join(issues))
+            parts.append("Problems: " + "; ".join(issues))
             score += 20 * len(issues)
         if align == "MISALIGNED":
             score += 30
@@ -1023,11 +1004,11 @@ def summarize_dkim_findings(parsed, from_header):
             score += 10
 
     if len(parsed) > 1:
-        parts.append("\nALERTA: múltiples firmas DKIM encontradas (posible reenvío o conflicto).")
+        parts.append("\nALERT: Multiple DKIM signatures found (possible forwarding or conflict).")
         score += 15
 
     if score == 0:
-        parts.append("\nSin anomalías DKIM evidentes (firma válida o formato coherente).")
+        parts.append("\nNo obvious DKIM anomalies (valid signature or consistent format).")
 
     return "\n".join(parts), score
 
@@ -1044,7 +1025,7 @@ def _find_python_exe_for_tools():
 
 def _find_external_dkim_script():
     """
-    Ruta esperada:
+    path:
     CORE/tfm_dkim_check.py
     """
     base = os.path.dirname(os.path.abspath(__file__))  # core directory
@@ -1055,8 +1036,8 @@ def _find_external_dkim_script():
 
 def run_external_dkim_check(raw_bytes, timeout=15):
     """
-    Lanza el checker Python3 externo pasando la RUTA de un archivo temporal
-    con los bytes crudos. Evita problemas de stdin en Jython.
+    Launch the external Python3 checker by passing the PATH to a temporary file
+    containing the raw bytes. Avoids stdin issues in Jython.
     """
     script = _find_external_dkim_script()
     if not script:
@@ -1102,50 +1083,50 @@ def run_external_dkim_check(raw_bytes, timeout=15):
 
 def _diagnose_dkim_variants(variants):
     """
-    Recibe la lista de variantes del verificador externo y devuelve
-    un diagnóstico humano-leyible del motivo probable del fallo/pase.
+    Receives the list of variants from the external verifier and returns
+    a human-readable diagnosis of the likely reason for the fail/pass.
     """
     if not variants:
-        return "Sin variantes reportadas (verificador externo no devolvió detalles)."
+        return "No variants reported (external verifier returned no details)."
 
-    # Map rápidos para inspección
+    # Maps
     by = {v.get("variant"): v for v in variants}
     raw_ok   = bool(by.get("raw", {}).get("verified"))
     lf_ok    = bool(by.get("lf_to_crlf", {}).get("verified"))
     eof_ok   = bool(by.get("crlf_ensure_eof", {}).get("verified"))
 
-    # Errores explícitos
+    # Errors
     errors = [v for v in variants if v.get("error")]
     if errors and not (raw_ok or lf_ok or eof_ok):
         # devuelve el primer error visible
         e = errors[0]
-        return u"Error de verificación en '{}': {}".format(e.get("variant"), e.get("error"))
+        return u"Error Verification at '{}': {}".format(e.get("variant"), e.get("error"))
 
     if raw_ok:
-        return "RAW=OK → los bytes del .eml son íntegros; al menos una firma verifica."
+        return "RAW=OK → the bytes of the .eml are intact; at least one signature is verified."
 
-    # Patrones de fallo típicos por EOL
+    # Typical failure patterns by EOL
     if (not raw_ok) and lf_ok and (not eof_ok):
-        return "Fallo por EOL: el archivo venía con \\n (LF) sueltos; tras normalizar a CRLF verifica."
+        return "EOL failure: the file came with loose \\n (LF) characters; after normalizing to CRLF, it checks."
     if (not raw_ok) and eof_ok and (not lf_ok):
-        return "Fallo por EOL final: faltaba CRLF final tras el cuerpo/boundary; al añadirlo verifica."
+        return "Final EOL failure: missing final CRLF after body/boundary; adding it verifies."
     if (not raw_ok) and lf_ok and eof_ok:
-        return "Fallo por EOL/terminación: combinación de \\n sueltos y ausencia de CRLF final."
+        return "EOL/termination failure: combination of loose \\n and absence of final CRLF."
 
     # Si ninguna variante verifica
-    return "Ninguna variante verifica: posible alteración del cuerpo/cabeceras o dependencia del entorno."
+    return "No variant checks: possible alteration of the body/headrests or dependence on the environment."
 
 def summarize_external_dkim_result(dkim_json):
     """
-    Convierte la estructura retornada por run_external_dkim_check() a
-    un string compacto y puntuación para Analysis Results, incluyendo
-    el detalle de variantes para diagnosticar por qué falla/pasa.
+    Converts the structure returned by run_external_dkim_check() to
+    a compact string and score for Analysis Results, including
+    variant details to diagnose why it fails/passes.
     """
     if not dkim_json:
-        return ("No hay resultado DKIM (error interno).", 50)
+        return ("No DKIM result (internal error).", 50)
 
     if "error" in dkim_json:
-        return ("Error DKIM externo: {} - {}".format(dkim_json.get('error'), dkim_json.get('msg', '')), 60)
+        return ("External DKIM error: {} - {}".format(dkim_json.get('error'), dkim_json.get('msg', '')), 60)
 
     parts = []
     score = 0
@@ -1153,7 +1134,7 @@ def summarize_external_dkim_result(dkim_json):
     sig_count = int(dkim_json.get('dkim_signatures_count', 0))
     parts.append("DKIM signatures: {}".format(sig_count))
 
-    # --- Detalle de firmas (DNS/alineación) ---
+    # --- Signature details (DNS/alignment) ---
     aligned_any = False
     dns_ok_any = False
     for i, s in enumerate(dkim_json.get('signatures', [])):
@@ -1164,24 +1145,24 @@ def summarize_external_dkim_result(dkim_json):
         if align == 'ALIGNED': aligned_any = True
         if sel_ok: dns_ok_any = True
 
-        parts.append("\n- Firma #{}: d={} s={}".format(i+1, d, sel))
+        parts.append("\n- Signature #{}: d={} s={}".format(i+1, d, sel))
         parts.append("  alignment={}".format(align))
         if not sel_ok:
-            parts.append("  selector DNS: NO encontrado")
+            parts.append("  selector DNS: NOT found")
             score += 15
         else:
             txts = s.get('selector_txt') or []
-            parts.append("  selector DNS: encontrado ({} records)".format(len(txts) if isinstance(txts, list) else 1))
+            parts.append("  selector DNS: Found ({} records)".format(len(txts) if isinstance(txts, list) else 1))
 
         if align == "MISALIGNED":
-            parts.append("  Nota: dominio DKIM distinto del dominio From: (MISALIGNED)")
+            parts.append("  Note: DKIM domain different from From: domain (MISALIGNED)")
             score += 25
 
-    # --- Variantes de verificación (triage) ---
+    # --- Verification variants (triage) ---
     verify = dkim_json.get('verify', {}) or {}
     variants = verify.get('variants') or []
 
-    # Línea compacta de estado por variante
+    # Compact status line by variant
     if variants:
         compact = []
         for v in variants:
@@ -1190,47 +1171,47 @@ def summarize_external_dkim_result(dkim_json):
                 compact.append("{}=OK".format(tag))
             else:
                 compact.append("{}={}".format(tag, "ERR" if v.get('error') and not v.get('attempted') else "NO"))
-        parts.append("\nVerificación (variantes): " + ", ".join(compact))
+        parts.append("\nVerification (variants): " + ", ".join(compact))
 
-        # Diagnóstico legible
+        # Diagnosis legible
         diag = _diagnose_dkim_variants(variants)
-        parts.append("Diagnóstico: " + diag)
+        parts.append("Diagnosis: " + diag)
 
-        # Puntuación según resultado global
+        # result global score 
         if any(v.get('verified') for v in variants):
-            parts.append("Verificación criptográfica: OK (al menos una variante verificó).")
+            parts.append("Cryptographic verification: OK (at least one variant verified).")
         else:
-            parts.append("Verificación criptográfica: FALLIDA (ninguna variante verificó).")
+            parts.append("Cryptographic verification: FAILED (no variant verified).")
             score += 20
-            # Heurística de “copia alterada” solo si hay indicios sólidos
+            # The "altered copy" heuristic only applies if there is strong evidence.
             usually = bool(dkim_json.get('domain_usually_signs'))
             if dns_ok_any and aligned_any and usually:
-                parts.append("Indicador fuerte: Selector DNS OK, alineación ALIGNED y el dominio suele firmar → posible alteración de bytes (EOL/cuerpo).")
+                parts.append("Strong indicator: DNS selector OK, alignment ALIGNED and the domain usually signs → possible byte alteration (EOL/body).")
                 score += 30
     else:
-        # Compatibilidad con versiones antiguas del checker
+        # Compatibility with older versions of the checker
         if verify.get('verify_attempted'):
             if verify.get('verified'):
-                parts.append("Verificación criptográfica: OK.")
+                parts.append("Cryptographic verification: OK.")
             else:
-                parts.append("Verificación criptográfica: FALLIDA. Error: {}".format(verify.get('verify_error')))
+                parts.append("Cryptographic verification: FAILED. Mistake: {}".format(verify.get('verify_error')))
                 score += 20
                 usually = bool(dkim_json.get('domain_usually_signs'))
                 if dns_ok_any and aligned_any and usually:
-                    parts.append("Indicador fuerte: Selector DNS OK, alineación ALIGNED y el dominio suele firmar → posible alteración de bytes (EOL/cuerpo).")
+                    parts.append("Strong indicator: DNS selector OK, alignment ALIGNED and the domain usually signs → possible byte alteration (EOL/body).")
                     score += 30
         else:
-            parts.append("Verificación criptográfica: NO REALIZADA (fallo en el entorno).")
+            parts.append("Cryptographic verification: NOT DONE (environment failure).")
             score += 40
 
-    # Contexto de whitelist (informativo)
+    # Whitelist context (informational)
     if dkim_json.get('domain_usually_signs'):
-        parts.append("\nContexto: Dominio del remitente suele firmar (whitelist).")
+        parts.append("\nContext: The sender's domain is usually signed (whitelist).")
     else:
-        parts.append("\nContexto: Dominio no marcado como 'suele firmar' en whitelist.")
+        parts.append("\nContext: Domain not marked as 'usually signs' in whitelist.")
 
     if score == 0:
-        parts.append("\nResumen: DKIM OK / sin problemas detectados por el verificador externo.")
+        parts.append("\nSummary: DKIM OK / no problems detected by the external verifier.")
 
     return ("\n".join(parts), int(score))
 
@@ -1241,8 +1222,8 @@ _AR_AUTHRES_ID_RE = re.compile(r'^\s*([a-z0-9.-]+)\s*;', re.IGNORECASE)
 
 def _parse_authres_line(line):
     """
-    Parsea una línea de Authentication-Results en pares clave=valor.
-    Devuelve dict con: 'authserv_id', 'kv' (dict llano), y listas por mecanismo.
+    Parses a line of Authentication-Results into key-value pairs.
+    Returns a dictionary containing: 'authserv_id', 'kv' (plain dictionary), and lists by mechanism.
     """
     out = {'raw': u_(line), 'authserv_id': None, 'kv': {}, 'spf': [], 'dmarc': [], 'dkim': [], 'arc': [], 'other': []}
     try:
@@ -1272,19 +1253,18 @@ def _parse_authres_line(line):
 
 def parse_authentication_results(msg):
     """
-    Devuelve lista de estructuras parseadas de 'Authentication-Results'.
-    Mantiene orden (de arriba a abajo).
+    Returns a list of parsed structures from 'Authentication-Results'.
+    Maintains order (from top to bottom).
     """
     ars = msg.get_all('Authentication-Results') or []
     parsed = []
     for ar in ars:
-        # Unir líneas dobladas para robustez
         line = ' '.join(u_(ar).split())
         parsed.append(_parse_authres_line(line))
     return parsed
 
 def _find_header_from_domain(from_header):
-    """Extrae dominio de From: para alineamientos DMARC/SPF."""
+    """Extract domain from From: for DMARC/SPF alignments."""
     if not from_header:
         return None
     fp = u_(from_header).strip().lower()
@@ -1296,11 +1276,11 @@ def _find_header_from_domain(from_header):
 
 def extract_received_spf(msg):
     """
-    Algunas plataformas añaden 'Received-SPF: ...'
-    Acepta:
-      - email.message.Message (preferido)
-      - lista de líneas 'Received-SPF'
-    Devuelve el primer veredicto normalizado, o None si no hay.
+    Some platforms add 'Received-SPF: ...'
+    Accepts:
+    - email.message.Message (preferred)
+    - list of 'Received-SPF' lines
+    Returns the first normalized verdict, or None if none is found.
     """
     if msg is None:
         return None
@@ -1327,8 +1307,8 @@ def extract_received_spf(msg):
 
 def evaluate_spf(authres_list, from_header, msg=None):
     """
-    Evalúa SPF según Authentication-Results (o Received-SPF como fallback con el objeto msg).
-    Retorna dict: {'result', 'smtp_mailfrom', 'helo', 'ip', 'aligned'}
+    Evaluates SPF based on Authentication-Results (or Received-SPF as a fallback with the msg object).
+    Returns dict: {'result', 'smtp_mailfrom', 'helo', 'ip', 'aligned'}
     """
     from_dom = _find_header_from_domain(from_header)
 
@@ -1359,11 +1339,11 @@ def evaluate_spf(authres_list, from_header, msg=None):
         if res['result']:
             break
 
-    # Fallback a Received-SPF solo si tenemos el objeto Message
+    # Fallback to Received-SPF only if we have the Message object
     if not res['result'] and msg is not None:
         res['result'] = extract_received_spf(msg)
 
-    # Dominio autenticado por SPF (MailFrom o HELO)
+    # Domain authenticated by SPF (MailFrom or HELO)
     mf_dom = _extract_domain(res['smtp_mailfrom'])
     helo_dom = _extract_domain(res['helo'])
     spf_dom = mf_dom or helo_dom
@@ -1382,18 +1362,18 @@ def evaluate_spf(authres_list, from_header, msg=None):
 
 def evaluate_dmarc(authres_list, from_header):
     """
-    Usa Authentication-Results: dmarc=pass/fail; header.from=dom;
-    Retorna dict: {'result','header_from','policy','aligned_spf_or_dkim'}
+    Use Authentication-Results: dmarc=pass/fail; header.from=dom;
+    Return dict: {'result','header_from','policy','aligned_spf_or_dkim'}
     """
     out = {'result': None, 'header_from': None, 'policy': None, 'aligned_spf_or_dkim': None}
     for ar in authres_list:
         kv = ar.get('kv') or {}
         if kv.get('dmarc'):
-            # a veces aparece 'dmarc=pass' como par básico; _parse_authres_line ya lo añadió a kv
+            # Sometimes 'dmarc=pass' appears as a basic pair; _parse_authres_line already added it to kv
             val = kv.get('dmarc')
             if val in ('pass', 'fail'):
                 out['result'] = val
-        # Campos comunes: header.from=, policy=, p=...
+        # common fields: header.from=, policy=, p=...
         for key in ('header.from', 'from.header', 'h.from'):
             if kv.get(key):
                 out['header_from'] = kv.get(key).lower()
@@ -1402,17 +1382,17 @@ def evaluate_dmarc(authres_list, from_header):
             if kv.get(key) and not out['policy']:
                 out['policy'] = kv.get(key).lower()
 
-        # A veces añade pistas: dmarc=pass (p=none) header.from=dom
+        # Sometimes it adds hints: dmarc=pass (p=none) header.from=dom
         if out['result']:
             break
 
-    # Alineamiento: si dmarc=pass asumimos que o SPF o DKIM alineó
+    # Alignment: if dmarc=pass we assume that either SPF or DKIM aligned
     if out['result'] == 'pass':
         out['aligned_spf_or_dkim'] = True
     elif out['result'] == 'fail':
         out['aligned_spf_or_dkim'] = False
 
-    # Si no hay header_from en AR, derivamos de From:
+    # If there is no header_from in AR, we derive from From:
     if not out['header_from']:
         out['header_from'] = _find_header_from_domain(from_header)
 
@@ -1420,9 +1400,9 @@ def evaluate_dmarc(authres_list, from_header):
 
 def parse_arc_chain(msg):
     """
-    Recolecta ARC-Seal, ARC-Message-Signature y ARC-Authentication-Results.
-    Determina instancias por i=, verifica completitud por índice (1..max(i)),
-    y obtiene last_cv como el cv del mayor i presente (no por orden de cabeceras).
+    Collects ARC-Seal, ARC-Message-Signature, and ARC-Authentication-Results.
+    Determines instances by i=, checks completeness by index (1..max(i)),
+    and obtains last_cv as the cv of the highest i present (not by header order).
     """
     import re
     seals = msg.get_all('ARC-Seal') or []
@@ -1463,13 +1443,13 @@ def parse_arc_chain(msg):
     complete = False
     if instances:
         expected = list(range(1, max(instances) + 1))
-        # completitud: todos los i presentes y cada i aparece en las 3 familias
+        # completeness: all i present and each i appears in all 3 families
         if instances == expected:
             complete = all(i in i_seal for i in expected) and \
                        all(i in i_ams  for i in expected) and \
                        all(i in i_aar  for i in expected)
 
-    # last_cv = cv del mayor i presente en ARC-Seal
+    # last_cv = cv of the highest i present in ARC-Seal
     cv_map = _i_to_cv_map(seals)
     last_cv = None
     if cv_map:
@@ -1485,23 +1465,23 @@ def parse_arc_chain(msg):
 
 def summarize_auth_policies(spf_res, dmarc_res, arc_res, from_header):
     """
-    Texto + puntuación para Analysis Results (SPF/DMARC/ARC).
+    Text + punctuation for Analysis Results (SPF/DMARC/ARC).
     """
     if not spf_res.get('result') and not dmarc_res.get('result') and not arc_res.get('count'):
-        return ("No se encontraron evidencias de autenticación SPF, DMARC ni ARC.", 10) # 10 puntos para enseñar que no hay nada de autenticacion
+        return ("No evidence of SPF, DMARC, or ARC authentication was found.", 10) # 10 puntos para enseñar que no hay nada de autenticacion
 
     parts = []
     score = 0
     from_dom = _find_header_from_domain(from_header)
 
-    parts.append("Identidad From: {}".format(from_dom or "AUSENTE"))
+    parts.append("Identity From: {}".format(from_dom or "MISSING"))
     parts.append("\n--- SPF ---")
-    parts.append("Resultado: {}".format(spf_res.get('result') or "desconocido"))
+    parts.append("Result: {}".format(spf_res.get('result') or "UNKNOWN"))
     if spf_res.get('smtp_mailfrom'):
         parts.append("smtp.mailfrom: {}".format(spf_res['smtp_mailfrom']))
     if spf_res.get('ip'):
         parts.append("client-ip: {}".format(spf_res['ip']))
-    parts.append("Alineación organizativa SPF↔From: {}".format("ALIGNED" if spf_res.get('aligned') else "MISALIGNED"))
+    parts.append("Organizational alignment SPF↔From: {}".format("ALIGNED" if spf_res.get('aligned') else "MISALIGNED"))
 
     # Scoring SPF
     r = (spf_res.get('result') or '').lower()
@@ -1515,25 +1495,25 @@ def summarize_auth_policies(spf_res, dmarc_res, arc_res, from_header):
         score += 5
     if spf_res.get('aligned') is False and r == 'pass':
         # SPF pasa pero no alinea → útil para DMARC
-        parts.append("Nota: SPF=pass pero dominio no alineado (no cumple DMARC por SPF).")
+        parts.append("Note: SPF=pass but domain not aligned (does not comply with DMARC by SPF).")
         score += 10
 
     parts.append("\n--- DMARC ---")
-    parts.append("Resultado: {}".format(dmarc_res.get('result') or "desconocido"))
+    parts.append("Result: {}".format(dmarc_res.get('result') or "UNKNOWN"))
     if dmarc_res.get('policy'):
-        parts.append("Política: {}".format(dmarc_res['policy']))
+        parts.append("Policy: {}".format(dmarc_res['policy']))
     if dmarc_res.get('header_from'):
         parts.append("header.from (AR): {}".format(dmarc_res['header_from']))
     if dmarc_res.get('result') == 'fail':
         score += 50
 
     parts.append("\n--- ARC ---")
-    parts.append("Instancias: {}".format(arc_res.get('count') or 0))
-    parts.append("Cadena completa: {}".format("Sí" if arc_res.get('complete') else "No"))
-    parts.append("Último ARC-Seal cv: {}".format(arc_res.get('last_cv') or "none"))
+    parts.append("Instancies: {}".format(arc_res.get('count') or 0))
+    parts.append("Complete Chain: {}".format("Sí" if arc_res.get('complete') else "No"))
+    parts.append("Last ARC-Seal cv: {}".format(arc_res.get('last_cv') or "none"))
     if arc_res.get('count', 0) > 0 and arc_res.get('last_cv') == 'fail':
         score += 30
-        parts.append("ALERTA: cv=fail en el último sello ARC (cadena no confiable).")
+        parts.append("ALERT: cv=fail in the last ARC seal (unreliable chain).")
 
     return "\n".join(parts), int(score)
 
@@ -1546,8 +1526,8 @@ def _find_external_auth_script():
 
 def run_external_auth_policies(raw_bytes, timeout=15):
     """
-    Lanza tfm_auth_policies_check.py (Python3) pasando el EML completo por stdin.
-    Devuelve dict JSON o eleva excepción si hay error duro/timeout.
+    Launch tfm_auth_policies_check.py (Python3) passing the complete EML to stdin.
+    Return a JSON dictionary or raise an exception if there is a hard error/timeout.
     """
     script = _find_external_auth_script()
     if not script:

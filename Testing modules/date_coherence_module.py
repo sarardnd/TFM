@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# tfm_email_dates_module.py — Date coherence inspector (Jython / Autopsy 4.22.x)
+# date_coherence_module.py
 
 import jarray, email
 from org.sleuthkit.autopsy.ingest import IngestModule, FileIngestModule, IngestModuleFactoryAdapter, IngestMessage, IngestServices
@@ -16,12 +16,12 @@ if CORE_PATH not in sys.path:
 import tfm_email_core as core
 
 MODULE_NAME = u"TFM Email Date Coherence"
-MODULE_VER= u"1.1" 
+MODULE_VER= u"1.0" 
 
 class TFMEmailDateCoherenceFactory(IngestModuleFactoryAdapter):
     moduleName = MODULE_NAME
     def getModuleDisplayName(self): return self.moduleName
-    def getModuleDescription(self): return u"Analiza la coherencia temporal entre Date: y Received: y metadatos de archivo. (v1.1)"
+    def getModuleDescription(self): return u"Analyze the temporal consistency between Date: and Received: and file metadata."
     def getModuleVersionNumber(self): return MODULE_VER
     def isFileIngestModuleFactory(self): return True
     def createFileIngestModule(self, settings): return TFMEmailDateCoherenceModule()
@@ -29,40 +29,38 @@ class TFMEmailDateCoherenceFactory(IngestModuleFactoryAdapter):
 class TFMEmailDateCoherenceModule(FileIngestModule):
     def process(self, f):
         name = f.getName()
-        # Solo procesa archivos .eml y que sean archivos reales (no carpetas, etc.)
         if (not f.isFile()) or (not name or not name.lower().endswith(".eml")):
             return IngestModule.ProcessResult.OK
             
-        # Extraer metadatos de archivo EML
+        # Extract metadata from EML file
         f_date = f.getCrtime() or f.getMtime() or 0
-        
-        # Nuevo: Hora actual de la ingesta (para comprobar fechas futuras)
+
         ingest_time = long(time.time()) 
         
         try:
-            # 1. Leer contenido del archivo
+            # 1. Read file
             istream = ReadContentInputStream(f)
             buf = jarray.zeros(int(f.getSize()), 'b'); istream.read(buf)
             content = buf.tostring()
             if not content: return IngestModule.ProcessResult.OK
 
-            # 2. Parsear mensaje y Received:
+            # 2. Parse message and Received:
             msg = email.message_from_string(content)
             hops = core.parse_received_chain(msg)
             
-            # 3. Obtener cabecera Date: (incluye detección de múltiples)
+            # 3. Get Date header
             date_epoch, date_str, is_multiple_date = core.get_date_header_epoch(msg) 
 
-            # 4. Obtener cabeceras alternativas (solo contexto)
+            # 4. Get alternative headers
             alt_dates = core.get_all_time_headers(msg) 
 
-            # 5. Analizar la coherencia
+            # 5. Analyze consistency
             issues = core.analyze_date_coherence(date_epoch, date_str, is_multiple_date, hops, f_date, ingest_time) 
             
-            # 6. Resumir hallazgos y puntuar
+            # 6. Summarize findings and score
             summary, score = core.summarize_date_coherence_findings(date_str, f_date, issues, alt_dates) 
 
-            # 7. Publicar resultado si hay puntuación > 0
+            # 7. Results
             self._hit(f, u"Date Coherence", summary, score)
                 
             return IngestModule.ProcessResult.OK

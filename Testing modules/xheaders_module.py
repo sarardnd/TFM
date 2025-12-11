@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# tfm_email_xheaders_module.py — Extrae y analiza cabeceras X-* (Jython / Autopsy 4.22.x)
+# xheaders_module.py
 
 import jarray, email, os, sys
 from org.sleuthkit.autopsy.ingest import IngestModule, FileIngestModule, IngestModuleFactoryAdapter
@@ -16,12 +16,12 @@ import tfm_email_core as core
 MODULE_NAME = u"TFM Email X-Headers"
 MODULE_VER  = u"1.0"
 
-ANALYSIS_SET_NAME = u"X-Headers analysis"  # <- Set Name consistente
+ANALYSIS_SET_NAME = u"X-Headers analysis"  
 
 class TFMXHeadersFactory(IngestModuleFactoryAdapter):
     moduleName = MODULE_NAME
     def getModuleDisplayName(self): return self.moduleName
-    def getModuleDescription(self): return u"Extrae X-headers (X-Mailer, X-Exported-By, etc.) y marca señales de exportación."
+    def getModuleDescription(self): return u"Extract X-headers (X-Mailer, X-Exported-By, etc.)."
     def getModuleVersionNumber(self): return MODULE_VER
     def isFileIngestModuleFactory(self): return True
     def createFileIngestModule(self, ingestOptions): return TFMXHeadersModule()
@@ -36,24 +36,24 @@ class TFMXHeadersModule(FileIngestModule):
             return IngestModule.ProcessResult.OK
 
         try:
-            # Leer contenido
+            # Read file
             istream = ReadContentInputStream(f)
             buf = jarray.zeros(int(f.getSize()), 'b')
             istream.read(buf)
             content = buf.tostring()
 
             if not content:
-                self._hit(f, ANALYSIS_SET_NAME, u"Sin contenido legible.", 0)
+                self._hit(f, ANALYSIS_SET_NAME, u"No readable content.", 0)
                 return IngestModule.ProcessResult.OK
 
-            # Parsear email
+            # Parse email
             try:
                 msg = email.message_from_string(content)
             except Exception:
-                self._hit(f, ANALYSIS_SET_NAME, u"No se pudo parsear el correo.", 0)
+                self._hit(f, ANALYSIS_SET_NAME, u"The email could not be parsed.", 0)
                 return IngestModule.ProcessResult.OK
 
-            # Extraer X-*
+            # Extract X-*
             xdata = core.extract_x_headers(msg)
             text, score = core.summarize_x_headers_findings(xdata)
 
@@ -61,7 +61,7 @@ class TFMXHeadersModule(FileIngestModule):
             return IngestModule.ProcessResult.OK
 
         except Exception:
-            self._hit(f, ANALYSIS_SET_NAME, u"Error no controlado durante el análisis.", 0)
+            self._hit(f, ANALYSIS_SET_NAME, u"Uncontrolled error during analysis.", 0)
             return IngestModule.ProcessResult.ERROR
 
     def _hit(self, f, set_name, desc, value):

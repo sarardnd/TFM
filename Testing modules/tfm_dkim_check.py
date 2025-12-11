@@ -2,19 +2,19 @@
 # -*- coding: utf-8 -*-
 """
 tfm_dkim_check.py
-Lee un mensaje EML desde --file (o stdin si no se pasa) y:
- - intenta verificar DKIM (dkimpy)
- - consulta selector DNS (dnspython)
- - reporta alineación d= vs From:
- - indica si el dominio está en whitelist local
-Salida: JSON en stdout
+Reads an EML message from --file (or stdin if no file is passed) and:
+- attempts to verify DKIM (dkimpy)
+- queries DNS selector (dnspython)
+- reports d= vs From: alignment
+- indicates if the domain is on the local whitelist
+Output: JSON to stdout
 """
 from __future__ import annotations
 import sys, json, re, os, argparse
 from email import policy
 from email.parser import BytesParser
 
-# Dependencias
+# Dependencies
 try:
     import dkim
     import dns.resolver
@@ -95,9 +95,9 @@ def dns_txt_lookup(fqdn):
     except Exception as e:
         return False, str(e)
 
-# ---- Variantes de verificación para diagnóstico
+# ---- Verification variants for diagnosis
 def normalize_lf_to_crlf(b):
-    # Convierte a '\n' primero para evitar duplicar CR
+    # Convert to '\n' first to avoid duplicating CR
     return b.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
 
 def ensure_final_crlf(b):
@@ -121,7 +121,7 @@ def main():
     if not raw:
         print(json.dumps({"error": "no_input"})); return
 
-    # Parse headers para contexto (no re-serializar)
+    # Parse headers for context (do not re-serialize)
     try:
         msg = BytesParser(policy=policy.default).parsebytes(raw)
     except Exception:
@@ -153,7 +153,7 @@ def main():
             entry["alignment"] = "UNKNOWN"
         results.append(entry)
 
-    # — Verificación (triage)
+    # — Verification (triage)
     variants = [
         verify_variant("raw", raw),
         verify_variant("lf_to_crlf", normalize_lf_to_crlf(raw)),
